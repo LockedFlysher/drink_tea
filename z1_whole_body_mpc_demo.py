@@ -235,8 +235,8 @@ class MPCConfig:
     # EE 跟踪权重（位置 / 姿态），适当加大以优先保证末端轨迹
     # 位置部分对 x/y 和 z 分别加权，方便强调高度方向
     w_pos_xy: float = 50.0    # EE 在 x/y 方向的位置权重
-    w_pos_z: float = 200.0    # EE 在 z 方向的位置权重（提高高度跟踪优先级）
-    w_ori: float = 10.0   # 末端姿态跟踪权重
+    w_pos_z:  float = 200.0   # EE 在 z 方向的位置权重（提高高度跟踪优先级）
+    w_ori:    float = 50.0    # 末端姿态（yaw 等）跟踪权重，提高 yaw 跟踪优先级
     # base (x,y) 位置跟踪权重（目前不加入代价，只保留字段备用）
     w_base: float = 0.0
     R_u: float = 1.0
@@ -490,8 +490,8 @@ def run_z1_whole_body_mpc_demo() -> None:
     # 用当前 x 初始化 MuJoCo 状态
     sim.reset_from_x(x, z_base=0.3)
 
-    # 单个参考点：世界坐标系中的绝对位置 (0, 0, 0.5)
-    p_target_world = np.array([0.0, 0.0, 0.5])
+    # 椭圆轨迹的中心（世界坐标系中的绝对位置）
+    ellipse_center_world = np.array([0.0, 0.0, 0.5])
 
     # 计算 Pinocchio 与 MuJoCo 之间的 EE 固定偏移，用于可视化对齐
     p_ee0_pin, _ = robot.fk_symbolic(ca.DM(x))
@@ -512,10 +512,28 @@ def run_z1_whole_body_mpc_demo() -> None:
         while viewer.is_running():
             t = time.time() - t0
 
-            # 构造 EE 参考轨迹：单个固定参考点（对所有 k 相同）
-            p_ref_traj = np.tile(p_target_world.reshape(3, 1), (1, cfg.horizon_steps + 1))
+            # 构造 EE 参考轨迹：在 XY 方向为椭圆，同时在 Z 方向加入周期性变化，
+            # 整条轨迹固定在世界坐标系中，以 ellipse_center_world 为中心。
+            a = 0.2
+            b = 0.1
+            z_center = ellipse_center_world[2]
+            z_amp = 0.1   # 椭圆在 z 方向的振幅
+            p_ref_traj = np.zeros((3, cfg.horizon_steps + 1))
             q_ref_traj = np.zeros((4, cfg.horizon_steps + 1))
-            q_ref_traj[0, :] = 1.0  # 姿态目标为单位四元数（朝上）
+
+            for k in range(cfg.horizon_steps + 1):
+                tk = t + k * cfg.dt
+                theta_e = 2.0 * math.pi * tk / 10.0  # 10s 一圈
+                x_e = ellipse_center_world[0] + a * math.cos(theta_e)
+                y_e = ellipse_center_world[1] + b * math.sin(theta_e)
+                z_e = z_center + z_amp * math.sin(theta_e)
+                p_ref_traj[:, k] = np.array([x_e, y_e, z_e])
+
+                # 参考姿态：绕世界 z 轴的 yaw 随椭圆参数变化
+                yaw_e = theta_e
+                qw = math.cos(yaw_e / 2.0)
+                qz = math.sin(yaw_e / 2.0)
+                q_ref_traj[:, k] = np.array([qw, 0.0, 0.0, qz])
 
             # 每 dt_sim 调用一次 MPC
             if t - last_mpc_time >= dt_sim:
@@ -560,31 +578,60 @@ def run_z1_whole_body_mpc_demo() -> None:
                 user_scn.ngeom = 0
                 geom_idx = 0
 
-                # 单个参考点：蓝点 + 朝上的黄箭头
-                # 由于 Pinocchio 和 MuJoCo 世界原点存在固定偏移，
-                # 这里在可视化时加上 ee_vis_offset 使两者对齐。
-                pos_e = p_target_world + ee_vis_offset
+                # 椭圆轨迹：离散的蓝点 + 朝上的黄箭头
+                n_ellipse = 32
+                for i in range(n_ellipse):
+                    theta_e = 2.0 * math.pi * i / float(n_ellipse)
+                    x_e = ellipse_center_world[0] + a * math.cos(theta_e)
+                    y_e = ellipse_center_world[1] + b * math.sin(theta_e)
+                    z_e = z_center + z_amp * math.sin(theta_e)
+                    pos_world = np.array([x_e, y_e, z_e])
 
-                mujoco.mjv_initGeom(
-                    user_scn.geoms[geom_idx],
-                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=[0.006, 0.0, 0.0],
-                    pos=pos_e,
-                    mat=np.eye(3).flatten(),
-                    rgba=[0.0, 0.4, 1.0, 0.8],
-                )
-                geom_idx += 1
+                    # 将 Pinocchio 世界坐标转换到 MuJoCo 世界坐标用于可视化
+                    pos_vis = pos_world + ee_vis_offset
 
-                arrow_len = 0.12
-                mujoco.mjv_initGeom(
-                    user_scn.geoms[geom_idx],
-                    type=mujoco.mjtGeom.mjGEOM_ARROW,
-                    size=[0.005, 0.0075, arrow_len],
-                    pos=pos_e,
-                    mat=np.eye(3).flatten(),
-                    rgba=[1.0, 0.9, 0.1, 0.9],
-                )
-                geom_idx += 1
+                    # 椭圆上的离散点（蓝色小球）
+                    mujoco.mjv_initGeom(
+                        user_scn.geoms[geom_idx],
+                        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                        size=[0.006, 0.0, 0.0],
+                        pos=pos_vis,
+                        mat=np.eye(3).flatten(),
+                        rgba=[0.0, 0.4, 1.0, 0.8],
+                    )
+                    geom_idx += 1
+
+                    # 表示 EE yaw 参考的箭头（黄色）：箭头方向沿椭圆切线（XY 平面）
+                    arrow_len = 0.12
+                    # 椭圆切线方向（XY 平面）
+                    dx = -a * math.sin(theta_e)
+                    dy =  b * math.cos(theta_e)
+                    dir_xy = np.array([dx, dy, 0.0])
+                    norm_dir = np.linalg.norm(dir_xy)
+                    if norm_dir < 1e-6:
+                        dir_xy = np.array([1.0, 0.0, 0.0])
+                        norm_dir = 1.0
+                    z_axis = dir_xy / norm_dir  # 作为局部 z 轴（箭头方向）
+                    # 构造一个正交基：先取全局 z，再叉积
+                    up = np.array([0.0, 0.0, 1.0])
+                    x_axis = np.cross(up, z_axis)
+                    norm_x = np.linalg.norm(x_axis)
+                    if norm_x < 1e-6:
+                        x_axis = np.array([1.0, 0.0, 0.0])
+                        norm_x = 1.0
+                    x_axis /= norm_x
+                    y_axis = np.cross(z_axis, x_axis)
+                    R_vis = np.column_stack([x_axis, y_axis, z_axis]).astype(float)
+
+                    mujoco.mjv_initGeom(
+                        user_scn.geoms[geom_idx],
+                        type=mujoco.mjtGeom.mjGEOM_ARROW,
+                        size=[0.005, 0.0075, arrow_len],
+                        pos=pos_vis,
+                        mat=R_vis.flatten(),
+                        rgba=[1.0, 0.9, 0.1, 0.9],
+                    )
+                    geom_idx += 1
 
                 user_scn.ngeom = geom_idx
 
