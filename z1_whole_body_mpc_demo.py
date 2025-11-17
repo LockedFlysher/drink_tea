@@ -493,6 +493,13 @@ def run_z1_whole_body_mpc_demo() -> None:
     # 单个参考点：世界坐标系中的绝对位置 (0, 0, 0.5)
     p_target_world = np.array([0.0, 0.0, 0.5])
 
+    # 计算 Pinocchio 与 MuJoCo 之间的 EE 固定偏移，用于可视化对齐
+    p_ee0_pin, _ = robot.fk_symbolic(ca.DM(x))
+    p_ee0_pin = np.array(p_ee0_pin.full()).reshape(3)
+    link06_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "link06")
+    p_ee0_mj = sim.data.xpos[link06_id].copy()
+    ee_vis_offset = p_ee0_mj - p_ee0_pin
+
     dt_sim = 0.02  # 仿真步长（独立于 MuJoCo 内部 dt，这里只用于 MPC）
     horizon_T = cfg.horizon_steps * cfg.dt
 
@@ -553,8 +560,10 @@ def run_z1_whole_body_mpc_demo() -> None:
                 user_scn.ngeom = 0
                 geom_idx = 0
 
-                # 单个参考点：蓝点 + 朝上的黄箭头（世界坐标系中固定）
-                pos_e = p_target_world
+                # 单个参考点：蓝点 + 朝上的黄箭头
+                # 由于 Pinocchio 和 MuJoCo 世界原点存在固定偏移，
+                # 这里在可视化时加上 ee_vis_offset 使两者对齐。
+                pos_e = p_target_world + ee_vis_offset
 
                 mujoco.mjv_initGeom(
                     user_scn.geoms[geom_idx],
