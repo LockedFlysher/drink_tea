@@ -233,7 +233,9 @@ class MPCConfig:
     horizon_steps: int = 20
     dt: float = 0.1
     # EE 跟踪权重（位置 / 姿态），适当加大以优先保证末端轨迹
-    w_pos: float = 50.0   # 末端位置跟踪权重
+    # 位置部分对 x/y 和 z 分别加权，方便强调高度方向
+    w_pos_xy: float = 50.0    # EE 在 x/y 方向的位置权重
+    w_pos_z: float = 200.0    # EE 在 z 方向的位置权重（提高高度跟踪优先级）
     w_ori: float = 10.0   # 末端姿态跟踪权重
     # base (x,y) 位置跟踪权重（目前不加入代价，只保留字段备用）
     w_base: float = 0.0
@@ -285,17 +287,18 @@ class WholeBodyMPC:
         self.U = U
 
         # 参数：
-        #   x0: 当前状态
-        #   p_ref_flat: 3*(N+1) 维向量，每个阶段的末端位置参考
-        #   q_ref_flat: 4*(N+1) 维向量，每个阶段的末端姿态参考四元数
+        #   x0: 当前状态 (9,)
+        #   p_ref: 末端位置参考 (3, N+1)
+        #   q_ref: 末端姿态参考四元数 (4, N+1)
         x0_param = opti.parameter(nx)
-        p_ref_flat = opti.parameter(3 * (N + 1))
-        q_ref_flat = opti.parameter(4 * (N + 1))
+        p_ref_param = opti.parameter(3, N + 1)
+        q_ref_param = opti.parameter(4, N + 1)
         self.x0_param = x0_param
-        self.p_ref_flat = p_ref_flat
-        self.q_ref_flat = q_ref_flat
+        self.p_ref_param = p_ref_param
+        self.q_ref_param = q_ref_param
 
-        w_pos = self.cfg.w_pos
+        w_pos_xy = self.cfg.w_pos_xy
+        w_pos_z = self.cfg.w_pos_z
         w_ori = self.cfg.w_ori
         R_u = self.cfg.R_u * ca.DM.eye(nu)
 
@@ -322,20 +325,23 @@ class WholeBodyMPC:
             # 末端 FK
             p_ee_k, R_ee_k = self.robot.fk_symbolic(x_k)
 
-            # 从参数中取出该阶段的参考 p_ref_k, q_ref_k
-            p_ref_k = p_ref_flat[3 * k : 3 * (k + 1)]
-            q_ref_k = q_ref_flat[4 * k : 4 * (k + 1)]
+            # 从参数矩阵中取出该阶段的参考 p_ref_k, q_ref_k
+            p_ref_k = p_ref_param[:, k]
+            q_ref_k = q_ref_param[:, k]
             R_ref_k = quat_to_rot(q_ref_k)
 
-            # 位置误差
+            # 位置误差（单独增强 z 方向权重）
             pos_err = p_ee_k - p_ref_k
+            pos_err_xy = pos_err[0:2]
+            pos_err_z = pos_err[2]
+
+            pos_cost = w_pos_xy * ca.dot(pos_err_xy, pos_err_xy) + w_pos_z * pos_err_z * pos_err_z
 
             # 姿态误差（SO(3)）
             ori_err = orientation_error_from_rot_matrices(R_ee_k, R_ref_k)
+            ori_cost = w_ori * ca.dot(ori_err, ori_err)
 
-            C_ee_k = w_pos * ca.dot(pos_err, pos_err) + w_ori * ca.dot(
-                ori_err, ori_err
-            )
+            C_ee_k = pos_cost + ori_cost
 
             # 关节 + base yaw 的索引：x[2] = φ_base, x[3:9] = q1..q6
             q_joint = ca.vertcat(x_k[2], x_k[3:9])
@@ -380,12 +386,9 @@ class WholeBodyMPC:
         p_ref_traj = np.asarray(p_ref_traj).reshape(3, self.N + 1)
         q_ref_traj = np.asarray(q_ref_traj).reshape(4, self.N + 1)
 
-        p_ref_flat = p_ref_traj.reshape(-1)
-        q_ref_flat = q_ref_traj.reshape(-1)
-
         self.opti.set_value(self.x0_param, x0)
-        self.opti.set_value(self.p_ref_flat, p_ref_flat)
-        self.opti.set_value(self.q_ref_flat, q_ref_flat)
+        self.opti.set_value(self.p_ref_param, p_ref_traj)
+        self.opti.set_value(self.q_ref_param, q_ref_traj)
 
         sol = self.opti.solve()
 
@@ -487,9 +490,8 @@ def run_z1_whole_body_mpc_demo() -> None:
     # 用当前 x 初始化 MuJoCo 状态
     sim.reset_from_x(x, z_base=0.3)
 
-    # 参考椭圆的中心在世界坐标系中固定，不依赖当前机器人状态
-    # 为了可视化清晰，这里选择一个略高于地面的点
-    ellipse_center_world = np.array([0.4, 0.0, 0.6])
+    # 单个参考点：世界坐标系中的绝对位置 (0, 0, 0.5)
+    p_target_world = np.array([0.0, 0.0, 0.5])
 
     dt_sim = 0.02  # 仿真步长（独立于 MuJoCo 内部 dt，这里只用于 MPC）
     horizon_T = cfg.horizon_steps * cfg.dt
@@ -503,25 +505,10 @@ def run_z1_whole_body_mpc_demo() -> None:
         while viewer.is_running():
             t = time.time() - t0
 
-            # 构造 EE 参考椭圆轨迹（世界坐标系中固定的轨迹，
-            # 与机器人当前状态无关，仅随时间变化）
-            a = 0.2
-            b = 0.1
-            z_ee = ellipse_center_world[2]
-            p_ref_traj = np.zeros((3, cfg.horizon_steps + 1))
+            # 构造 EE 参考轨迹：单个固定参考点（对所有 k 相同）
+            p_ref_traj = np.tile(p_target_world.reshape(3, 1), (1, cfg.horizon_steps + 1))
             q_ref_traj = np.zeros((4, cfg.horizon_steps + 1))
-
-            for k in range(cfg.horizon_steps + 1):
-                tk = t + k * cfg.dt
-                theta_e = 2.0 * math.pi * tk / 10.0  # 10s 一圈
-                x_e_world = ellipse_center_world[0] + a * math.cos(theta_e)
-                y_e_world = ellipse_center_world[1] + b * math.sin(theta_e)
-                p_world = np.array([x_e_world, y_e_world, z_ee])
-
-                # 控制层与可视化层都在同一世界坐标下定义参考
-                p_ref_traj[:, k] = p_world
-                # 姿态参考：始终朝上（单位四元数）
-                q_ref_traj[:, k] = np.array([1.0, 0.0, 0.0, 0.0])
+            q_ref_traj[0, :] = 1.0  # 姿态目标为单位四元数（朝上）
 
             # 每 dt_sim 调用一次 MPC
             if t - last_mpc_time >= dt_sim:
@@ -566,35 +553,29 @@ def run_z1_whole_body_mpc_demo() -> None:
                 user_scn.ngeom = 0
                 geom_idx = 0
 
-                # EE 椭圆离散点（世界坐标），与 MPC 参考一致：
-                # 轨迹完全固定在世界坐标系中，不随机器人移动
-                n_ellipse = 32
-                for i in range(n_ellipse):
-                    theta_e = 2.0 * math.pi * i / float(n_ellipse)
-                    x_e = ellipse_center_world[0] + a * math.cos(theta_e)
-                    y_e = ellipse_center_world[1] + b * math.sin(theta_e)
-                    pos_e = np.array([x_e, y_e, z_ee])
+                # 单个参考点：蓝点 + 朝上的黄箭头（世界坐标系中固定）
+                pos_e = p_target_world
 
-                    mujoco.mjv_initGeom(
-                        user_scn.geoms[geom_idx],
-                        type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                        size=[0.006, 0.0, 0.0],
-                        pos=pos_e,
-                        mat=np.eye(3).flatten(),
-                        rgba=[0.0, 0.4, 1.0, 0.8],
-                    )
-                    geom_idx += 1
+                mujoco.mjv_initGeom(
+                    user_scn.geoms[geom_idx],
+                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                    size=[0.006, 0.0, 0.0],
+                    pos=pos_e,
+                    mat=np.eye(3).flatten(),
+                    rgba=[0.0, 0.4, 1.0, 0.8],
+                )
+                geom_idx += 1
 
-                    arrow_len = 0.12
-                    mujoco.mjv_initGeom(
-                        user_scn.geoms[geom_idx],
-                        type=mujoco.mjtGeom.mjGEOM_ARROW,
-                        size=[0.005, 0.0075, arrow_len],
-                        pos=pos_e,
-                        mat=np.eye(3).flatten(),
-                        rgba=[1.0, 0.9, 0.1, 0.9],
-                    )
-                    geom_idx += 1
+                arrow_len = 0.12
+                mujoco.mjv_initGeom(
+                    user_scn.geoms[geom_idx],
+                    type=mujoco.mjtGeom.mjGEOM_ARROW,
+                    size=[0.005, 0.0075, arrow_len],
+                    pos=pos_e,
+                    mat=np.eye(3).flatten(),
+                    rgba=[1.0, 0.9, 0.1, 0.9],
+                )
+                geom_idx += 1
 
                 user_scn.ngeom = geom_idx
 
