@@ -58,106 +58,91 @@ except ImportError as exc:  # pragma: no cover
 @dataclass
 class RobotWrapper:
     """
-    使用 Pinocchio 构造一个 9-DOF 的 planar base + 6-DOF arm 模型：
-        q = [x, y, φ, q1..q6]
-    只用于在 MPC 中求符号 FK 和末端姿态。
+    使用 Pinocchio 从 Z1 的 URDF 构造「臂」模型，
+    并在 MPC 中外加一个平面 base (x,y,φ)，从而实现：
+        x = [x_base, y_base, φ_base, q1..q6] ∈ R^9
+
+    这里：
+      - Pinocchio 模型只负责 6-DOF 机械臂（固定在 world 上）
+      - 平面 base 的变换由我们在 FK 里显式加上 SE(3) 变换
     """
 
-    ee_frame_name: str = "ee"
+    urdf_path: str = "z1.urdf"
+    ee_frame_name: str = "link06"  # Z1 末端 link 名
 
     def __post_init__(self) -> None:
-        self.model = self._build_synthetic_planar_model()
+        # 1) 从 URDF 构造固定基座的 Z1 模型（只包含 6 个关节）
+        self.model = pin.buildModelFromUrdf(self.urdf_path)
         self.data = self.model.createData()
 
+        # 2) CasADi 模型，用于符号 FK（q_arm 维度 = model.nq）
         self.cmodel = cpin.Model(self.model)
         self.cdata = self.cmodel.createData()
 
         self.ee_frame_id = self.cmodel.getFrameId(self.ee_frame_name)
         if self.ee_frame_id < 0:
-            raise ValueError(f"End-effector frame '{self.ee_frame_name}' not found.")
+            raise ValueError(
+                f"End-effector frame '{self.ee_frame_name}' not found in URDF model."
+            )
 
-        # 构建 CasADi 符号 FK: p_ee(q), R_ee(q)
-        q_sym = ca.SX.sym("q", self.model.nq)
-        cpin.forwardKinematics(self.cmodel, self.cdata, q_sym)
+        # 3) 以 q_arm 为变量构造符号 FK（末端在“臂基座”坐标系下的位置和姿态）
+        q_arm_sym = ca.SX.sym("q_arm", self.model.nq)
+        cpin.forwardKinematics(self.cmodel, self.cdata, q_arm_sym)
         cpin.updateFramePlacements(self.cmodel, self.cdata)
         placement = self.cdata.oMf[self.ee_frame_id]
-        p_ee = placement.translation
-        R_ee = placement.rotation
+        p_ee_local = placement.translation
+        R_ee_local = placement.rotation
 
-        self.fk_pos_fun = ca.Function("fk_pos", [q_sym], [p_ee])
-        self.fk_rot_fun = ca.Function("fk_rot", [q_sym], [R_ee])
+        self.fk_arm_pos = ca.Function("fk_arm_pos", [q_arm_sym], [p_ee_local])
+        self.fk_arm_rot = ca.Function("fk_arm_rot", [q_arm_sym], [R_ee_local])
+
+        if self.model.nq != 6:
+            raise RuntimeError(
+                f"Expected arm nq=6 for Z1, but URDF model reports nq={self.model.nq}."
+            )
 
     @property
-    def nq(self) -> int:
+    def nq_arm(self) -> int:
+        """Z1 机械臂关节自由度数（应为 6）"""
         return int(self.model.nq)
 
-    def fk_symbolic(self, q: ca.SX) -> Tuple[ca.SX, ca.SX]:
-        p_ee = self.fk_pos_fun(q)
-        R_ee = self.fk_rot_fun(q)
-        return p_ee, R_ee
-
-    def _build_synthetic_planar_model(self) -> pin.Model:
+    def fk_symbolic(self, x_full: ca.SX) -> Tuple[ca.SX, ca.SX]:
         """
-        构造一个简单的 planar base + 6-DOF arm 模型：
-            q = [x, y, φ, q1..q6]
-        base: PX -> PY -> RZ
-        arm: 6x RZ，沿 x 轴串联
+        在 MPC 中的 FK：
+          输入  x = [x_base, y_base, φ_base, q1..q6]^T
+          输出  世界坐标下的末端位置/姿态 (p_ee, R_ee)
+
+        计算步骤：
+          1) 用 q_arm = x[3:9] 调用 Z1 的 FK，获得“臂基座”系下的 p_local, R_local
+          2) 平面 base 变换: T_base(x,y,φ) = Trans(x,y,0) · RotZ(φ)
+          3) 世界系下末端:
+                R = R_base * R_local
+                p = p_base + R_base * p_local
         """
-        model = pin.Model()
-        parent_id = 0
+        # 拆分平面 base 与 arm 关节
+        x_base = x_full[0]
+        y_base = x_full[1]
+        phi_base = x_full[2]
+        q_arm = x_full[3 : 3 + self.model.nq]
 
-        # base_x
-        jx = pin.JointModelPX()
-        jid_x = model.addJoint(parent_id, jx, pin.SE3.Identity(), "base_x")
-        model.appendBodyToJoint(jid_x, pin.Inertia.Random(), pin.SE3.Identity())
+        # 机械臂 FK（在“臂基座”坐标系下）
+        p_local = self.fk_arm_pos(q_arm)
+        R_local = self.fk_arm_rot(q_arm)
 
-        # base_y
-        jy = pin.JointModelPY()
-        jid_y = model.addJoint(jid_x, jy, pin.SE3.Identity(), "base_y")
-        model.appendBodyToJoint(jid_y, pin.Inertia.Random(), pin.SE3.Identity())
-
-        # base_yaw (RZ)
-        jz = pin.JointModelRZ()
-        base_joint_id = model.addJoint(jid_y, jz, pin.SE3.Identity(), "base_yaw")
-        model.appendBodyToJoint(base_joint_id, pin.Inertia.Random(), pin.SE3.Identity())
-
-        # 机械臂 6 关节
-        link_parent = base_joint_id
-        link_offset = 0.25
-        for i in range(6):
-            joint_name = f"joint{i+1}"
-            link_name = f"link{i+1}"
-            j = pin.JointModelRZ()
-            X_pj = pin.SE3.Identity()
-            X_pj.translation = np.array([link_offset, 0.0, 0.0])
-            jid = model.addJoint(link_parent, j, X_pj, joint_name)
-            model.appendBodyToJoint(jid, pin.Inertia.Random(), pin.SE3.Identity())
-            model.addFrame(
-                pin.Frame(
-                    link_name,
-                    jid,
-                    0,
-                    pin.SE3.Identity(),
-                    pin.FrameType.BODY,
-                )
-            )
-            link_parent = jid
-
-        # 末端执行器 frame
-        model.addFrame(
-            pin.Frame(
-                self.ee_frame_name,
-                link_parent,
-                0,
-                pin.SE3.Identity(),
-                pin.FrameType.OP_FRAME,
-            )
+        # 平面 base 变换
+        c = ca.cos(phi_base)
+        s = ca.sin(phi_base)
+        R_base = ca.vertcat(
+            ca.hcat([c, -s, 0]),
+            ca.hcat([s,  c, 0]),
+            ca.hcat([0,  0, 1]),
         )
+        p_base = ca.vertcat(x_base, y_base, 0)
 
-        if model.nq != 9:
-            raise RuntimeError(f"Synthetic model nq={model.nq}, expected 9.")
-
-        return model
+        # 世界坐标下的末端位置和姿态
+        p_world = p_base + ca.mtimes(R_base, p_local)
+        R_world = ca.mtimes(R_base, R_local)
+        return p_world, R_world
 
 
 # --------------------------------------------------------------------------- #
@@ -247,17 +232,22 @@ def relaxed_log_barrier(h: ca.SX, mu: float, delta: float) -> ca.SX:
 class MPCConfig:
     horizon_steps: int = 20
     dt: float = 0.1
-    w_pos: float = 10.0
-    w_ori: float = 5.0
-    R_u: float = 0.1
+    # EE 跟踪权重（位置 / 姿态），适当加大以优先保证末端轨迹
+    w_pos: float = 50.0   # 末端位置跟踪权重
+    w_ori: float = 10.0   # 末端姿态跟踪权重
+    # base (x,y) 位置跟踪权重（目前不加入代价，只保留字段备用）
+    w_base: float = 0.0
+    R_u: float = 1.0
+    # 以下两个参数仅在使用 barrier 版本时有用，
+    # 当前实现已改为“硬约束”，不再使用松弛对数势。
     mu_barrier: float = 1e-2
     delta_barrier: float = 1e-3
 
     # 关节和速度上下界（这里只对 φ_base + 6 个臂关节约束，x,y 不约束）
     q_min: float = -3.14
     q_max: float = 3.14
-    dq_min: float = -2.0
-    dq_max: float = 2.0
+    dq_min: float = -1.0
+    dq_max: float = 1.0
 
 
 class WholeBodyMPC:
@@ -272,8 +262,9 @@ class WholeBodyMPC:
     def __init__(self, robot: RobotWrapper, cfg: MPCConfig) -> None:
         self.robot = robot
         self.cfg = cfg
-        self.nx = robot.nq  # 9
-        self.nu = robot.nq  # 9
+        # 状态/控制维度固定为 9（[x,y,φ,q1..q6]）
+        self.nx = 9
+        self.nu = 9
         self.N = cfg.horizon_steps
 
         self._build_ocp()
@@ -315,9 +306,6 @@ class WholeBodyMPC:
         dq_min_vec = self.cfg.dq_min * ca.DM.ones(n_joints, 1)
         dq_max_vec = self.cfg.dq_max * ca.DM.ones(n_joints, 1)
 
-        mu_b = self.cfg.mu_barrier
-        delta_b = self.cfg.delta_barrier
-
         # 初始条件
         opti.subject_to(X[:, 0] == x0_param)
 
@@ -353,20 +341,16 @@ class WholeBodyMPC:
             q_joint = ca.vertcat(x_k[2], x_k[3:9])
             dq_joint = ca.vertcat(u_k[2], u_k[3:9])
 
-            # 约束统一形式: h = [q - q_min, q_max - q, dq - dq_min, dq_max - dq]
-            h_q_low = q_joint - q_min_vec
-            h_q_high = q_max_vec - q_joint
-            h_dq_low = dq_joint - dq_min_vec
-            h_dq_high = dq_max_vec - dq_joint
-            h_vec = ca.vertcat(h_q_low, h_q_high, h_dq_low, h_dq_high)
-
-            B_vec = relaxed_log_barrier(h_vec, mu_b, delta_b)
-            L_B_k = ca.sum1(B_vec)
+            # 关节位置/速度的硬约束（取代 barrier）:
+            #   q_min <= q_joint <= q_max
+            #   dq_min <= dq_joint <= dq_max
+            opti.subject_to(opti.bounded(q_min_vec, q_joint, q_max_vec))
+            opti.subject_to(opti.bounded(dq_min_vec, dq_joint, dq_max_vec))
 
             # 控制能量
             effort_k = ca.mtimes([u_k.T, R_u, u_k])
 
-            total_cost += C_ee_k + L_B_k + effort_k
+            total_cost += C_ee_k + effort_k
 
         opti.minimize(total_cost)
 
@@ -493,8 +477,8 @@ def run_z1_whole_body_mpc_demo() -> None:
 
     sim = Z1MuJoCoSim()
 
-    # 初始状态 x = [R_base, 0, 0, 0..0]
-    R_base = 0.3
+    # 初始状态 x = [R_base, 0, 0, 0..0]（控制层坐标）
+    R_base = 0.0
     x = np.zeros(9)
     x[0] = R_base
     x[1] = 0.0
@@ -503,19 +487,9 @@ def run_z1_whole_body_mpc_demo() -> None:
     # 用当前 x 初始化 MuJoCo 状态
     sim.reset_from_x(x, z_base=0.3)
 
-    # 1) 使用 Pinocchio FK 计算合成模型下的 EE 初始位置（控制层坐标）
-    p_ee0_pin = robot.fk_pos_fun(ca.DM(x)).full().reshape(3)
-
-    # 2) 使用 MuJoCo 计算 Z1 实际末端（这里用 body 'link06'）的初始位置（世界坐标）
-    link06_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "link06")
-    p_ee0_mj = sim.data.xpos[link06_id].copy()
-
-    # 3) 记录两个坐标系之间的平移偏移，用于对齐 MPC 参考与可视化
-    #    令  p_world = p_pin + offset  ⇒ offset = p_world - p_pin
-    offset_ee = p_ee0_mj - p_ee0_pin
-
-    # 椭圆的可视化中心取 MuJoCo 下的 EE 初始位置
-    ee_center_xy_world = np.array([float(p_ee0_mj[0]), float(p_ee0_mj[1])])
+    # 参考椭圆的中心在世界坐标系中固定，不依赖当前机器人状态
+    # 为了可视化清晰，这里选择一个略高于地面的点
+    ellipse_center_world = np.array([0.4, 0.0, 0.6])
 
     dt_sim = 0.02  # 仿真步长（独立于 MuJoCo 内部 dt，这里只用于 MPC）
     horizon_T = cfg.horizon_steps * cfg.dt
@@ -529,25 +503,23 @@ def run_z1_whole_body_mpc_demo() -> None:
         while viewer.is_running():
             t = time.time() - t0
 
-            # 构造 EE 参考椭圆轨迹：
-            #   - 世界坐标下：以 p_ee0_mj 为中心的椭圆
-            #   - 控制层（Pinocchio）坐标：减去 offset_ee，使几何上对齐
+            # 构造 EE 参考椭圆轨迹（世界坐标系中固定的轨迹，
+            # 与机器人当前状态无关，仅随时间变化）
             a = 0.2
             b = 0.1
-            z_ee = 0.6
+            z_ee = ellipse_center_world[2]
             p_ref_traj = np.zeros((3, cfg.horizon_steps + 1))
             q_ref_traj = np.zeros((4, cfg.horizon_steps + 1))
 
             for k in range(cfg.horizon_steps + 1):
                 tk = t + k * cfg.dt
                 theta_e = 2.0 * math.pi * tk / 10.0  # 10s 一圈
-                x_e_world = ee_center_xy_world[0] + a * math.cos(theta_e)
-                y_e_world = ee_center_xy_world[1] + b * math.sin(theta_e)
+                x_e_world = ellipse_center_world[0] + a * math.cos(theta_e)
+                y_e_world = ellipse_center_world[1] + b * math.sin(theta_e)
                 p_world = np.array([x_e_world, y_e_world, z_ee])
 
-                # 把期望轨迹从世界坐标映射到 Pinocchio 控制层坐标
-                p_pin = p_world - offset_ee
-                p_ref_traj[:, k] = p_pin
+                # 控制层与可视化层都在同一世界坐标下定义参考
+                p_ref_traj[:, k] = p_world
                 # 姿态参考：始终朝上（单位四元数）
                 q_ref_traj[:, k] = np.array([1.0, 0.0, 0.0, 0.0])
 
@@ -555,9 +527,35 @@ def run_z1_whole_body_mpc_demo() -> None:
             if t - last_mpc_time >= dt_sim:
                 X_star, U_star = mpc.solve(x, p_ref_traj, q_ref_traj)
                 u0 = U_star[:, 0]
+
+                # 为了数值稳定，在应用到系统前对速度做简单剪裁
+                v_xy_max = 0.3     # base 平移速度上限 [m/s]
+                v_phi_max = 1.0    # base yaw 角速度上限 [rad/s]
+                dq_max = 1.0       # 关节速度上限 [rad/s]
+
+                u0_clipped = u0.copy()
+                # base 线速度
+                u0_clipped[0] = float(np.clip(u0_clipped[0], -v_xy_max, v_xy_max))
+                u0_clipped[1] = float(np.clip(u0_clipped[1], -v_xy_max, v_xy_max))
+                # base yaw 角速度
+                u0_clipped[2] = float(np.clip(u0_clipped[2], -v_phi_max, v_phi_max))
+                # 6 个关节速度
+                u0_clipped[3:] = np.clip(u0_clipped[3:], -dq_max, dq_max)
+
+                u0 = u0_clipped
                 # 更新内部状态 (Euler)
                 x = x + cfg.dt * u0
                 last_mpc_time = t
+
+                # 调试输出：末端执行器的当前位置与参考之间的误差
+                p_ee_mpc, _ = robot.fk_symbolic(ca.DM(x))
+                p_ee_mpc = np.array(p_ee_mpc.full()).reshape(3)
+                p_ref_now = p_ref_traj[:, 0]
+                ee_err = p_ee_mpc - p_ref_now
+                print(
+                    f"t={t:.2f}  EE pos={p_ee_mpc}  "
+                    f"ref={p_ref_now}  err={ee_err}"
+                )
 
             # 用当前 x 更新 MuJoCo 姿态
             sim.reset_from_x(x, z_base=0.3)
@@ -568,12 +566,13 @@ def run_z1_whole_body_mpc_demo() -> None:
                 user_scn.ngeom = 0
                 geom_idx = 0
 
-                # EE 椭圆离散点（世界坐标，中心在 MuJoCo EE 初始位置）
+                # EE 椭圆离散点（世界坐标），与 MPC 参考一致：
+                # 轨迹完全固定在世界坐标系中，不随机器人移动
                 n_ellipse = 32
                 for i in range(n_ellipse):
                     theta_e = 2.0 * math.pi * i / float(n_ellipse)
-                    x_e = ee_center_xy_world[0] + a * math.cos(theta_e)
-                    y_e = ee_center_xy_world[1] + b * math.sin(theta_e)
+                    x_e = ellipse_center_world[0] + a * math.cos(theta_e)
+                    y_e = ellipse_center_world[1] + b * math.sin(theta_e)
                     pos_e = np.array([x_e, y_e, z_ee])
 
                     mujoco.mjv_initGeom(

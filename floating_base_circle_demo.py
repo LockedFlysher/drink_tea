@@ -30,6 +30,7 @@ import math
 import time
 from typing import Tuple
 
+import casadi as ca
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -77,6 +78,101 @@ def angle_wrap(angle: float) -> float:
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
+class BaseVelocityMPC:
+    """
+    简单的 2D 速度层 MPC：
+        x = [x, y]^T
+        u = [v_x, v_y]^T
+        x_{k+1} = x_k + dt * u_k
+    目标：跟踪给定的参考轨迹 x_ref_k。
+    """
+
+    def __init__(self, horizon_steps: int, dt: float, v_max: float = 1.0):
+        self.N = horizon_steps
+        self.dt = dt
+        self.v_max = v_max
+
+        opti = ca.Opti()
+        self.opti = opti
+
+        # 决策变量
+        X = opti.variable(2, self.N + 1)
+        U = opti.variable(2, self.N)
+        self.X = X
+        self.U = U
+
+        # 参数：当前状态和参考轨迹
+        x0_param = opti.parameter(2)
+        xref_param = opti.parameter(2, self.N + 1)
+        self.x0_param = x0_param
+        self.xref_param = xref_param
+
+        # 动力学约束
+        opti.subject_to(X[:, 0] == x0_param)
+        for k in range(self.N):
+            x_k = X[:, k]
+            u_k = U[:, k]
+            x_next = X[:, k + 1]
+            opti.subject_to(x_next == x_k + dt * u_k)
+
+        # 速度约束
+        opti.subject_to(opti.bounded(-v_max, U, v_max))
+
+        # 代价函数：位置误差 + 控制能量
+        Q = ca.DM.eye(2)
+        R = 0.1 * ca.DM.eye(2)
+        cost = 0
+        for k in range(self.N + 1):
+            e_k = X[:, k] - xref_param[:, k]
+            cost += ca.mtimes([e_k.T, Q, e_k])
+            if k < self.N:
+                u_k = U[:, k]
+                cost += ca.mtimes([u_k.T, R, u_k])
+        opti.minimize(cost)
+
+        # 求解器
+        opts = {
+            "ipopt.print_level": 0,
+            "ipopt.max_iter": 50,
+            "print_time": 0,
+        }
+        opti.solver("ipopt", opts)
+
+        # 初始解（用于 warm-start）
+        self._X_init = np.zeros((2, self.N + 1))
+        self._U_init = np.zeros((2, self.N))
+
+    def solve(self, x0: np.ndarray, xref_traj: np.ndarray) -> np.ndarray:
+        """
+        求解一次 MPC，返回第一个控制量 u0。
+
+        Args:
+            x0: 当前状态 (2,) 或 (2,1)
+            xref_traj: 参考轨迹 (2, N+1)
+        """
+        x0 = np.asarray(x0).reshape(2)
+        xref_traj = np.asarray(xref_traj).reshape(2, self.N + 1)
+
+        self.opti.set_value(self.x0_param, x0)
+        self.opti.set_value(self.xref_param, xref_traj)
+
+        # warm start
+        self.opti.set_initial(self.X, self._X_init)
+        self.opti.set_initial(self.U, self._U_init)
+
+        sol = self.opti.solve()
+
+        X_opt = np.array(sol.value(self.X))
+        U_opt = np.array(sol.value(self.U))
+
+        # 缓存 warm-start
+        self._X_init = X_opt
+        self._U_init = U_opt
+
+        u0 = U_opt[:, 0]
+        return u0
+
+
 def run_circle_tracking_demo() -> None:
     """
     使用 robot_description/z1_floating_base.xml 作为 base+机械臂模型，
@@ -107,8 +203,15 @@ def run_circle_tracking_demo() -> None:
     period = 10.0        # 一圈时间 [s]
     omega_traj = 2 * math.pi / period  # 角速度 [rad/s]
 
-    # 简单位置反馈增益（调大/调小可以观察效果）
-    Kp_pos = 1.5
+    # MPC 配置（速度层）：2D x=[x,y], u=[vx,vy]
+    sim_dt = model.opt.timestep          # MuJoCo 内部时间步长
+    mpc_steps = 20                       # 每隔多少个 sim 步调用一次 MPC
+    mpc_dt = sim_dt * mpc_steps          # MPC 离散时间步长
+    mpc_horizon = 20                     # MPC 预测步长
+    v_max = 1.0                          # 速度上界 [m/s]
+    mpc = BaseVelocityMPC(horizon_steps=mpc_horizon, dt=mpc_dt, v_max=v_max)
+    last_u = np.zeros(2)                 # 上一次 MPC 输出的速度
+    sim_step = 0
 
     # 初始姿态：取默认 quaternion，但把 base 放到圆上、z 提高到 0.3
     initial_quat = data.qpos[idx_quat_start:idx_quat_start + 4].copy()
@@ -127,6 +230,7 @@ def run_circle_tracking_demo() -> None:
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
             t = time.time() - t0
+            sim_step += 1
 
             # 在 user_scn 中重画一圈离散圆点（base 参考圆轨迹）
             user_scn = getattr(viewer, "user_scn", None)
@@ -201,11 +305,21 @@ def run_circle_tracking_demo() -> None:
             x = data.qpos[idx_x]
             y = data.qpos[idx_y]
 
-            # 3) 简单的 P 控制：速度 = 参考速度 + 位置误差 * 增益
-            ex = x_ref - x
-            ey = y_ref - y
-            v_x_cmd = vx_ref + Kp_pos * ex
-            v_y_cmd = vy_ref + Kp_pos * ey
+            # 3) 速度层 MPC：每 mpc_steps 步求解一次
+            if sim_step % mpc_steps == 0:
+                # 构造 MPC 参考轨迹 x_ref[k] = 圆上的点 (k=0..N)
+                t0_mpc = t
+                ref_traj = np.zeros((2, mpc_horizon + 1))
+                for k in range(mpc_horizon + 1):
+                    tk = t0_mpc + k * mpc_dt
+                    theta_k = omega_traj * tk
+                    ref_traj[0, k] = R * math.cos(theta_k)
+                    ref_traj[1, k] = R * math.sin(theta_k)
+
+                x0_vec = np.array([x, y])
+                last_u = mpc.solve(x0_vec, ref_traj)
+
+            v_x_cmd, v_y_cmd = last_u[0], last_u[1]
 
             # 4) 直接在 qpos 上用离散积分更新 base 的 x/y（纯 kinematic 方式）
             dt = model.opt.timestep
