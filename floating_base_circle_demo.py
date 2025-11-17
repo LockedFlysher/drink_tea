@@ -35,77 +35,41 @@ import mujoco.viewer
 import numpy as np
 
 
-def build_planar_base_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
+def build_z1_floating_base_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
     """
-    创建一个带 3 个自由度 (x, y, ϕ) 的方块 base，并直接在 MJCF 里
-    用一圈红色小球离散表示目标圆轨迹。
+    使用仓库中的 robot_description/z1_floating_base.xml 作为
+    base + 6-DOF 机械臂的测试模型。
 
-    MJCF 结构：
-        - slide joint: x
-        - slide joint: y
-        - hinge joint: yaw (ϕ, 绕 z 轴)
-        - geom: box（作为可视化）
-        - 多个 sphere geom：红色小球离散表示参考圆轨迹
+    - base 是一个 free joint（float_base_joint），包含 6 DOF：
+        qpos[0:3] = [x, y, z]
+        qpos[3:7] = quaternion [qw, qx, qy, qz]
+        qvel[0:3] = [ωx, ωy, ωz]
+        qvel[3:6] = [vx, vy, vz]
+    - arm 是 Z1 的 6 个关节 joint1..joint6。
+
+    本 demo 只控制 base 的平移速度 (vx, vy)，并将 yaw 固定。
     """
-    R = 0.3          # 圆半径 [m]
-    z = 0.3          # 圆所在高度 [m]
-    n_markers = 64   # 离散点个数
-
-    marker_geoms = []
-    for i in range(n_markers):
-        theta = 2.0 * math.pi * i / float(n_markers)
-        x = R * math.cos(theta)
-        y = R * math.sin(theta)
-        marker_geoms.append(
-            f'<geom name="traj_marker_{i}" type="sphere" size="0.015 0.015 0.015" '
-            f'pos="{x:.4f} {y:.4f} {z:.4f}" rgba="1 0 0 0.8"/>'
-        )
-    markers_xml = "\n        ".join(marker_geoms)
-
-    mjcf = f"""
-    <mujoco>
-      <option timestep="0.01" gravity="0 0 0"/>
-      <worldbody>
-        <!-- 简单地板和光源 -->
-        <light name="sun" pos="0 0 2.0" dir="0 0 -1" diffuse="1 1 1" specular="0.1 0.1 0.1"/>
-        <geom name="floor" type="plane" size="1 1 0.1" pos="0 0 0"
-              rgba="0.8 0.8 0.8 1.0"/>
-
-        <!-- 参考圆轨迹的离散点（红色小球） -->
-        {markers_xml}
-
-        <!-- 浮动基座（方块），z 固定 0.3 m -->
-        <body name="base" pos="0 0 0.3">
-          <joint name="base_x" type="slide" axis="1 0 0" />
-          <joint name="base_y" type="slide" axis="0 1 0" />
-          <joint name="base_yaw" type="hinge" axis="0 0 1" />
-          <geom name="base_box" type="box" size="0.05 0.05 0.05" rgba="0.2 0.4 0.8 1.0"/>
-        </body>
-      </worldbody>
-    </mujoco>
-    """
-    model = mujoco.MjModel.from_xml_string(mjcf)
+    model = mujoco.MjModel.from_xml_path("robot_description/z1_floating_base.xml")
     data = mujoco.MjData(model)
+
+    # 为了简化，可关闭重力，让 base+arm 悬浮运动
+    model.opt.gravity[:] = np.array([0.0, 0.0, 0.0])
+
     return model, data
 
 
-def get_base_dof_indices(model: mujoco.MjModel) -> Tuple[int, int, int, int, int, int]:
+def get_z1_base_indices(model: mujoco.MjModel) -> Tuple[int, int]:
     """
-    获取 x, y, yaw 三个关节在 qpos 和 qvel 中的下标。
+    获取 Z1 浮动基座的 free joint 起始索引。
+
+    返回:
+        qpos_base: qpos 中 free joint 起始索引（预计为 0）
+        qvel_base: qvel 中 free joint 起始索引（预计为 0）
     """
-    j_x = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "base_x")
-    j_y = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "base_y")
-    j_yaw = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "base_yaw")
-
-    qx = model.jnt_qposadr[j_x]
-    qy = model.jnt_qposadr[j_y]
-    qphi = model.jnt_qposadr[j_yaw]
-
-    vx = model.jnt_dofadr[j_x]
-    vy = model.jnt_dofadr[j_y]
-    vphi = model.jnt_dofadr[j_yaw]
-
-    return qx, qy, qphi, vx, vy, vphi
+    j_free = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "float_base_joint")
+    qpos_base = model.jnt_qposadr[j_free]
+    qvel_base = model.jnt_dofadr[j_free]
+    return qpos_base, qvel_base
 
 
 def angle_wrap(angle: float) -> float:
@@ -115,14 +79,28 @@ def angle_wrap(angle: float) -> float:
 
 def run_circle_tracking_demo() -> None:
     """
-    让方块 base 以速度控制方式跟踪一个平面圆轨迹：
+    使用 robot_description/z1_floating_base.xml 作为 base+机械臂模型，
+    让 Z1 浮动基座在 X/Y 平面上以速度控制方式跟踪一个圆轨迹：
         - 圆心在 (0, 0)，半径 R = 0.3 m
-        - 高度固定 z = 0.3 m（由 body 初始 pos 决定）
+        - 高度固定 z = 0.3 m
         - 角速度 ω 控制绕圈速度
-        - yaw 角 ϕ 固定为 0，不随轨迹变化
+        - yaw 角（通过 quaternion 表示）固定为初始值，不随轨迹变化
     """
-    model, data = build_planar_base_model()
-    qx, qy, qphi, vx, vy, vphi = get_base_dof_indices(model)
+    model, data = build_z1_floating_base_model()
+    qpos_base, qvel_base = get_z1_base_indices(model)
+
+    # free joint 对应的 qpos / qvel 索引
+    idx_x = qpos_base + 0
+    idx_y = qpos_base + 1
+    idx_z = qpos_base + 2
+    idx_quat_start = qpos_base + 3  # qw
+
+    idx_wx = qvel_base + 0
+    idx_wy = qvel_base + 1
+    idx_wz = qvel_base + 2
+    idx_vx = qvel_base + 3
+    idx_vy = qvel_base + 4
+    idx_vz = qvel_base + 5
 
     # 轨迹参数
     R = 0.3              # 圆半径 [m]
@@ -132,21 +110,84 @@ def run_circle_tracking_demo() -> None:
     # 简单位置反馈增益（调大/调小可以观察效果）
     Kp_pos = 1.5
 
-    # 初始状态设在圆上，方便观察
-    data.qpos[qx] = R
-    data.qpos[qy] = 0.0
-    data.qpos[qphi] = 0.0  # yaw 固定为 0
+    # 初始姿态：取默认 quaternion，但把 base 放到圆上、z 提高到 0.3
+    initial_quat = data.qpos[idx_quat_start:idx_quat_start + 4].copy()
+    initial_z = 0.3
+    data.qpos[idx_x] = R
+    data.qpos[idx_y] = 0.0
+    data.qpos[idx_z] = initial_z
+    data.qpos[idx_quat_start:idx_quat_start + 4] = initial_quat
+
     mujoco.mj_forward(model, data)
 
     t0 = time.time()
 
-    print("Starting floating base circle-tracking demo (velocity control).")
+    print("Starting Z1 floating-base circle-tracking demo (velocity control).")
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
             t = time.time() - t0
 
-            # 1) 圆轨迹参考位置和速度（X/Y 平行于地面，z 固定在 0.3）
+            # 在 user_scn 中重画一圈离散圆点（base 参考圆轨迹）
+            user_scn = getattr(viewer, "user_scn", None)
+            if user_scn is not None:
+                user_scn.ngeom = 0
+                geom_idx = 0
+
+                # base 参考圆轨迹（红色圆点）
+                n_markers = 64
+                for i in range(n_markers):
+                    theta_m = 2.0 * math.pi * i / float(n_markers)
+                    x_m = R * math.cos(theta_m)
+                    y_m = R * math.sin(theta_m)
+                    pos_m = np.array([x_m, y_m, initial_z])
+                    mujoco.mjv_initGeom(
+                        user_scn.geoms[geom_idx],
+                        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                        size=[0.0075, 0.0, 0.0],  # 半径缩小一半
+                        pos=pos_m,
+                        mat=np.eye(3).flatten(),
+                        rgba=[1.0, 0.0, 0.0, 0.7],
+                    )
+                    geom_idx += 1
+
+                # 末端执行器参考轨迹：在 z=0.6 的椭圆（蓝点 + 朝上的黄箭头）
+                a = 0.2   # 椭圆长轴
+                b = 0.1   # 椭圆短轴
+                z_ee = 0.6
+                n_ellipse = 32
+                for i in range(n_ellipse):
+                    theta_e = 2.0 * math.pi * i / float(n_ellipse)
+                    x_e = a * math.cos(theta_e)
+                    y_e = b * math.sin(theta_e)
+                    pos_e = np.array([x_e, y_e, z_ee])
+
+                    # 椭圆上的离散点（蓝色小球）
+                    mujoco.mjv_initGeom(
+                        user_scn.geoms[geom_idx],
+                        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                        size=[0.006, 0.0, 0.0],  # 半径缩小一半
+                        pos=pos_e,
+                        mat=np.eye(3).flatten(),
+                        rgba=[0.0, 0.4, 1.0, 0.8],
+                    )
+                    geom_idx += 1
+
+                    # 始终朝上的箭头（黄色），表示执行器朝向
+                    arrow_len = 0.12
+                    mujoco.mjv_initGeom(
+                        user_scn.geoms[geom_idx],
+                        type=mujoco.mjtGeom.mjGEOM_ARROW,
+                        size=[0.005, 0.0075, arrow_len],  # 箭头“更细”，长度保持不变
+                        pos=pos_e,
+                        mat=np.eye(3).flatten(),  # 局部 z 轴对齐全局 z 轴 ⇒ 箭头朝上
+                        rgba=[1.0, 0.9, 0.1, 0.9],
+                    )
+                    geom_idx += 1
+
+                user_scn.ngeom = geom_idx
+
+            # 1) 圆轨迹参考位置和速度（X/Y 平行于地面，z 固定在 initial_z）
             theta = omega_traj * t
 
             x_ref = R * math.cos(theta)
@@ -156,9 +197,9 @@ def run_circle_tracking_demo() -> None:
             vx_ref = -R * omega_traj * math.sin(theta)
             vy_ref = R * omega_traj * math.cos(theta)
 
-            # 2) 读取当前状态
-            x = data.qpos[qx]
-            y = data.qpos[qy]
+            # 2) 读取当前 base 状态
+            x = data.qpos[idx_x]
+            y = data.qpos[idx_y]
 
             # 3) 简单的 P 控制：速度 = 参考速度 + 位置误差 * 增益
             ex = x_ref - x
@@ -166,17 +207,20 @@ def run_circle_tracking_demo() -> None:
             v_x_cmd = vx_ref + Kp_pos * ex
             v_y_cmd = vy_ref + Kp_pos * ey
 
-            # 4) 把命令直接写入 qvel（即“速度控制”）
-            data.qvel[vx] = v_x_cmd
-            data.qvel[vy] = v_y_cmd
-            # yaw 角速度固定为 0，使 ϕ 始终保持为初始值 0
-            data.qvel[vphi] = 0.0
+            # 4) 直接在 qpos 上用离散积分更新 base 的 x/y（纯 kinematic 方式）
+            dt = model.opt.timestep
+            data.qpos[idx_x] += dt * v_x_cmd
+            data.qpos[idx_y] += dt * v_y_cmd
 
-            # 5) 用 MuJoCo 的时间步长积分一次
-            mujoco.mj_step(model, data)
+            # 保持 z 和 quaternion 固定，yaw 不随运动改变
+            data.qpos[idx_z] = initial_z
+            data.qpos[idx_quat_start:idx_quat_start + 4] = initial_quat
+
+            # 只做前向运算更新几何位置（不走动力学积分）
+            mujoco.mj_forward(model, data)
 
             # 可选：在终端打印一些状态，方便理解
-            # print(f"t={t:.2f}, x={x:.3f}, y={y:.3f}, phi={phi:.2f}")
+            # print(f"t={t:.2f}, x={x:.3f}, y={y:.3f}")
 
             viewer.sync()
 
