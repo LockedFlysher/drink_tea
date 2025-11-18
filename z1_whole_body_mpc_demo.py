@@ -224,6 +224,91 @@ def relaxed_log_barrier(h: ca.SX, mu: float, delta: float) -> ca.SX:
 
 
 # --------------------------------------------------------------------------- #
+# 参考轨迹：从预生成的 NPZ 中加载并按时间采样                             #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ReferenceTrajectory:
+    """
+    从 npz 文件中加载预设的末端轨迹：
+      - t_grid: (N,)     时间戳
+      - p_ref: (N,3)     末端位置（世界坐标）
+      - q_ref: (N,4)     末端姿态（四元数，假定仅绕 z 轴的 yaw）
+
+    提供 sample(t_query) 接口，用于在任意时间 t 上插值得到 (p, q)。
+    对姿态，仅对 yaw 做线性插值，再构造四元数。
+    """
+
+    t_grid: np.ndarray
+    p_ref: np.ndarray
+    q_ref: np.ndarray
+    yaw_grid: np.ndarray
+    period: float
+
+    @classmethod
+    def from_npz(cls, path: str = "z1_mpc_reference_traj.npz") -> "ReferenceTrajectory":
+        try:
+            data = np.load(path)
+        except FileNotFoundError as exc:  # pragma: no cover
+            raise FileNotFoundError(
+                f"Reference trajectory file '{path}' not found.\n"
+                "请先在仓库根目录运行：\n"
+                "  python generate_z1_mpc_reference_traj_npz.py\n"
+                "生成预设的参考轨迹。"
+            ) from exc
+
+        t_grid = np.asarray(data["t"], dtype=float).ravel()
+        p_ref = np.asarray(data["p_ref"], dtype=float)
+        q_ref = np.asarray(data["q_ref"], dtype=float)
+
+        if t_grid.ndim != 1:
+            raise ValueError("t_grid 应为一维数组。")
+        if p_ref.shape[0] != t_grid.shape[0] or q_ref.shape[0] != t_grid.shape[0]:
+            raise ValueError("p_ref / q_ref 与 t_grid 的长度不一致。")
+        if p_ref.shape[1] != 3 or q_ref.shape[1] != 4:
+            raise ValueError("p_ref 形状应为 (N,3)，q_ref 形状应为 (N,4)。")
+        if t_grid.size < 2:
+            raise ValueError("参考轨迹长度过短。")
+
+        # 仅支持绕 z 轴的 yaw，假定 q = [qw, 0, 0, qz]
+        yaw_grid = 2.0 * np.arctan2(q_ref[:, 3], q_ref[:, 0])
+
+        dt = float(t_grid[1] - t_grid[0])
+        period = float(dt * (t_grid.size - 1))
+
+        return cls(
+            t_grid=t_grid,
+            p_ref=p_ref,
+            q_ref=q_ref,
+            yaw_grid=yaw_grid,
+            period=period,
+        )
+
+    def sample(self, t_query: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        在时间 t_query 上插值得到 (p, q)：
+          - 对位置做逐分量线性插值；
+          - 对 yaw 做线性插值，再构造 q = [cos(yaw/2), 0, 0, sin(yaw/2)]。
+        轨迹按 period 做周期延拓。
+        """
+        t0 = float(self.t_grid[0])
+        # 周期延拓
+        t_mod = ((float(t_query) - t0) % self.period) + t0
+
+        px = float(np.interp(t_mod, self.t_grid, self.p_ref[:, 0]))
+        py = float(np.interp(t_mod, self.t_grid, self.p_ref[:, 1]))
+        pz = float(np.interp(t_mod, self.t_grid, self.p_ref[:, 2]))
+        p = np.array([px, py, pz], dtype=float)
+
+        yaw = float(np.interp(t_mod, self.t_grid, self.yaw_grid))
+        qw = math.cos(yaw / 2.0)
+        qz = math.sin(yaw / 2.0)
+        q = np.array([qw, 0.0, 0.0, qz], dtype=float)
+        return p, q
+
+
+# --------------------------------------------------------------------------- #
 # Whole-body MPC 构建 (状态 9 维, 控制 9 维)                                  #
 # --------------------------------------------------------------------------- #
 
@@ -480,6 +565,9 @@ def run_z1_whole_body_mpc_demo() -> None:
 
     sim = Z1MuJoCoSim()
 
+    # 预设的末端轨迹（位置 + yaw 姿态），从 NPZ 文件中加载
+    ref_traj = ReferenceTrajectory.from_npz("z1_mpc_reference_traj.npz")
+
     # 初始状态 x = [R_base, 0, 0, 0..0]（控制层坐标）
     R_base = 0.0
     x = np.zeros(9)
@@ -490,9 +578,6 @@ def run_z1_whole_body_mpc_demo() -> None:
     # 用当前 x 初始化 MuJoCo 状态
     sim.reset_from_x(x, z_base=0.3)
 
-    # 椭圆轨迹的中心（世界坐标系中的绝对位置）
-    ellipse_center_world = np.array([0.0, 0.0, 0.5])
-
     # 计算 Pinocchio 与 MuJoCo 之间的 EE 固定偏移，用于可视化对齐
     p_ee0_pin, _ = robot.fk_symbolic(ca.DM(x))
     p_ee0_pin = np.array(p_ee0_pin.full()).reshape(3)
@@ -500,7 +585,7 @@ def run_z1_whole_body_mpc_demo() -> None:
     p_ee0_mj = sim.data.xpos[link06_id].copy()
     ee_vis_offset = p_ee0_mj - p_ee0_pin
 
-    dt_sim = 0.02  # 仿真步长（独立于 MuJoCo 内部 dt，这里只用于 MPC）
+    dt_sim = 0.02  # 控制更新时间（独立于 MuJoCo 内部 dt）
     horizon_T = cfg.horizon_steps * cfg.dt
 
     print("Starting Z1 whole-body MPC demo. Close viewer to stop.")
@@ -512,28 +597,15 @@ def run_z1_whole_body_mpc_demo() -> None:
         while viewer.is_running():
             t = time.time() - t0
 
-            # 构造 EE 参考轨迹：在 XY 方向为椭圆，同时在 Z 方向加入周期性变化，
-            # 整条轨迹固定在世界坐标系中，以 ellipse_center_world 为中心。
-            a = 0.2
-            b = 0.1
-            z_center = ellipse_center_world[2]
-            z_amp = 0.1   # 椭圆在 z 方向的振幅
+            # 从预设轨迹中构造 MPC 参考（位置 + 姿态）
             p_ref_traj = np.zeros((3, cfg.horizon_steps + 1))
             q_ref_traj = np.zeros((4, cfg.horizon_steps + 1))
 
             for k in range(cfg.horizon_steps + 1):
                 tk = t + k * cfg.dt
-                theta_e = 2.0 * math.pi * tk / 10.0  # 10s 一圈
-                x_e = ellipse_center_world[0] + a * math.cos(theta_e)
-                y_e = ellipse_center_world[1] + b * math.sin(theta_e)
-                z_e = z_center + z_amp * math.sin(theta_e)
-                p_ref_traj[:, k] = np.array([x_e, y_e, z_e])
-
-                # 参考姿态：绕世界 z 轴的 yaw 随椭圆参数变化
-                yaw_e = theta_e
-                qw = math.cos(yaw_e / 2.0)
-                qz = math.sin(yaw_e / 2.0)
-                q_ref_traj[:, k] = np.array([qw, 0.0, 0.0, qz])
+                p_k, q_k = ref_traj.sample(tk)
+                p_ref_traj[:, k] = p_k
+                q_ref_traj[:, k] = q_k
 
             # 每 dt_sim 调用一次 MPC
             if t - last_mpc_time >= dt_sim:
@@ -572,25 +644,25 @@ def run_z1_whole_body_mpc_demo() -> None:
             # 用当前 x 更新 MuJoCo 姿态
             sim.reset_from_x(x, z_base=0.3)
 
-            # 可视化参考轨迹：在 user_scn 中画 EE 椭圆 (点+箭头)
+            # 可视化参考轨迹：在 user_scn 中画 EE 轨迹 (点+箭头)，基于预设轨迹
             user_scn = getattr(viewer, "user_scn", None)
             if user_scn is not None:
                 user_scn.ngeom = 0
                 geom_idx = 0
 
-                # 椭圆轨迹：离散的蓝点 + 朝上的黄箭头
-                n_ellipse = 32
-                for i in range(n_ellipse):
-                    theta_e = 2.0 * math.pi * i / float(n_ellipse)
-                    x_e = ellipse_center_world[0] + a * math.cos(theta_e)
-                    y_e = ellipse_center_world[1] + b * math.sin(theta_e)
-                    z_e = z_center + z_amp * math.sin(theta_e)
-                    pos_world = np.array([x_e, y_e, z_e])
+                # 轨迹点：离散的蓝点 + 表示 yaw 的黄箭头
+                n_points = min(64, ref_traj.p_ref.shape[0])
+                indices = np.linspace(0, ref_traj.p_ref.shape[0] - 1, n_points).astype(
+                    int
+                )
+
+                for idx_i in indices:
+                    pos_world = ref_traj.p_ref[idx_i]
 
                     # 将 Pinocchio 世界坐标转换到 MuJoCo 世界坐标用于可视化
                     pos_vis = pos_world + ee_vis_offset
 
-                    # 椭圆上的离散点（蓝色小球）
+                    # 轨迹上的离散点（蓝色小球）
                     mujoco.mjv_initGeom(
                         user_scn.geoms[geom_idx],
                         type=mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -601,12 +673,12 @@ def run_z1_whole_body_mpc_demo() -> None:
                     )
                     geom_idx += 1
 
-                    # 表示 EE yaw 参考的箭头（黄色）：箭头方向沿椭圆切线（XY 平面）
+                    # 表示 EE yaw 参考的箭头（黄色）：箭头方向沿 yaw 朝向（XY 平面）
                     arrow_len = 0.12
-                    # 椭圆切线方向（XY 平面）
-                    dx = -a * math.sin(theta_e)
-                    dy =  b * math.cos(theta_e)
-                    dir_xy = np.array([dx, dy, 0.0])
+                    yaw_e = ref_traj.yaw_grid[idx_i]
+                    dir_xy = np.array(
+                        [math.cos(yaw_e), math.sin(yaw_e), 0.0], dtype=float
+                    )
                     norm_dir = np.linalg.norm(dir_xy)
                     if norm_dir < 1e-6:
                         dir_xy = np.array([1.0, 0.0, 0.0])
