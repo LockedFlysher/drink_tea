@@ -4,6 +4,5 @@
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/mujoco_viewer" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/pynebula" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/z1_ros" vcs="Git" />
   </component>
 </project>

@@ -67,7 +67,7 @@ class RobotWrapper:
       - 平面 base 的变换由我们在 FK 里显式加上 SE(3) 变换
     """
 
-    urdf_path: str = "z1.urdf"
+    urdf_path: str = "robot_description/z1.urdf"
     ee_frame_name: str = "link06"  # Z1 末端 link 名
 
     def __post_init__(self) -> None:
