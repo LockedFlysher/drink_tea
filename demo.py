@@ -353,17 +353,18 @@ class ReferenceTrajectory:
 # --------------------------------------------------------------------------- #
 
 @dataclass
-class MPCConfig:
-    horizon_steps: int = 20
+class MPCConfig:    
     dt: float = 0.01
+    horizon_steps: int = 20
 
     # ---- EE tracking weights ----
-    w_pos: float = 100.0     # 位置误差权重
-    w_ori: float = 50.0      # 姿态误差权重
+    w_pos: float = 1000.0     # 位置误差权重
+    w_ori: float = 100.0      # 姿态误差权重
 
     # ---- control weight ----
-    R_u: float = 1.0          # 输入代价 u^T R u
-
+    # R_u: float = 1.0          # 输入代价 u^T R u
+    R_u: ca.DM = ca.diag([0.1, 0.1, 0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])  # Example values
+    
     # ---- relaxed log-barrier weights ----
     mu_barrier: float = 5e-3   # 势函数权重 μ
     delta_barrier: float = 1e-4  # 松弛 δ
@@ -421,7 +422,8 @@ class WholeBodyMPC:
         # ---- 代价权重 ----
         w_pos = self.cfg.w_pos     # 位置误差权重
         w_ori = self.cfg.w_ori        # 姿态误差权重
-        R_u = self.cfg.R_u * ca.DM.eye(nu)
+        # R_u = self.cfg.R_u * ca.DM.eye(nu)
+        R_u = self.cfg.R_u
 
         mu = self.cfg.mu_barrier
         delta = self.cfg.delta_barrier
@@ -489,7 +491,7 @@ class WholeBodyMPC:
         # 求解器选项
         opts = {
             "ipopt.print_level": 0,
-            "ipopt.max_iter": 80,
+            "ipopt.max_iter": 100,
             "print_time": 0,
         }
         opti.solver("ipopt", opts)
@@ -604,8 +606,8 @@ def run_z1_whole_body_mpc_demo() -> None:
 
     sim = Z1MuJoCoSim()
 
-    # 预设的末端轨迹（位置 + yaw 姿态），从 NPZ 文件中加载
-    ref_traj = ReferenceTrajectory.from_npz("trajectory_with_psi_correct_20251129_032510.npz")
+    # 预设的末端轨迹（位置 + 姿态），从 NPZ 文件中加载
+    ref_traj = ReferenceTrajectory.from_npz("trajectory_with_psi_correct_20251129_225627.npz")
 
     # 初始状态 x = [R_base, 0, 0, 0..0]（控制层坐标）
     R_base = 0.0
@@ -615,7 +617,7 @@ def run_z1_whole_body_mpc_demo() -> None:
     x[2] = 0.0  # φ_base
 
     # 用当前 x 初始化 MuJoCo 状态
-    sim.reset_from_x(x, z_base=0.3)
+    sim.reset_from_x(x, z_base=0.0)
 
     # 计算 Pinocchio 与 MuJoCo 之间的 EE 固定偏移，用于可视化对齐
     p_ee0_pin, _ = robot.fk_symbolic(ca.DM(x))
@@ -652,9 +654,9 @@ def run_z1_whole_body_mpc_demo() -> None:
                 u0 = U_star[:, 0]
 
                 # 为了数值稳定，在应用到系统前对速度做简单剪裁
-                v_xy_max = 0.3     # base 平移速度上限 [m/s]
-                v_phi_max = 1.0    # base yaw 角速度上限 [rad/s]
-                dq_max = 1.0       # 关节速度上限 [rad/s]
+                v_xy_max = 10.0     # base 平移速度上限 [m/s]
+                v_phi_max = 10.0    # base yaw 角速度上限 [rad/s]
+                dq_max = 10.0       # 关节速度上限 [rad/s]
 
                 u0_clipped = u0.copy()
                 # base 线速度
@@ -681,7 +683,7 @@ def run_z1_whole_body_mpc_demo() -> None:
                 )
 
             # 用当前 x 更新 MuJoCo 姿态
-            sim.reset_from_x(x, z_base=0.3)
+            sim.reset_from_x(x, z_base=0.0)
 
             # 可视化参考轨迹：在 user_scn 中画 EE 轨迹 (点+箭头)，基于预设轨迹
             user_scn = getattr(viewer, "user_scn", None)
