@@ -336,7 +336,7 @@ class MPCConfig:
     dq_min: float = -1.0
     dq_max: float = 1.0
 
-
+#机械臂mpc
 class WholeBodyMPC:
     """
     Whole-body MPC:
