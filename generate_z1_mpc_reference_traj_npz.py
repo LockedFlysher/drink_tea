@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-
+from dataclasses import field
 import numpy as np
-
 
 @dataclass
 class Z1ReferenceTrajectoryConfig:
@@ -17,10 +16,9 @@ class Z1ReferenceTrajectoryConfig:
       - 末端执行器在世界系中沿椭圆运动，并在 z 方向加入周期性起伏
       - 姿态仅绕世界 z 轴旋转（yaw）
     """
-
     dt_ref: float = 0.02
     period: float = 10.0
-    ellipse_center: np.ndarray = np.array([0.0, 0.0, 0.5])
+    ellipse_center: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.5]))
     a: float = 0.2  # x 方向半径
     b: float = 0.1  # y 方向半径
     z_amp: float = 0.1
