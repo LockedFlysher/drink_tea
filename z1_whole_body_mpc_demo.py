@@ -153,9 +153,6 @@ class RobotWrapper:
 def rot_to_quat(R: ca.SX) -> ca.SX:
     """
     旋转矩阵 R -> 四元数 q = [qw, qx, qy, qz]^T
-
-    注意：本 demo 中 MPC 代价已改用基于旋转矩阵的姿态误差，
-    该函数保留仅作潜在调试用途。
     """
     qw = ca.sqrt(ca.fmax(0, 1 + R[0, 0] + R[1, 1] + R[2, 2])) / 2
     qx = (R[2, 1] - R[1, 2]) / (4 * qw + 1e-9)
@@ -188,17 +185,33 @@ def quat_to_rot(q: ca.SX) -> ca.SX:
     return ca.vertcat(row0, row1, row2)
 
 
-def orientation_error_from_rot_matrices(R: ca.SX, R_ref: ca.SX) -> ca.SX:
-    """
-    基于旋转矩阵的姿态误差（SO(3)）:
-        e ≈ 0.5 * vee( R_ref^T R - R^T R_ref )
-    e ∈ R^3
+# ---- 四元数工具与误差（基于“减法/相对四元数”） ----
+def quat_conj(q: ca.SX) -> ca.SX:
+    return ca.vertcat(q[0], -q[1], -q[2], -q[3])
 
-    在小角度下与四元数误差等价，数值上更稳定。
+def quat_mul(q1: ca.SX, q2: ca.SX) -> ca.SX:
+    w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+    w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return ca.vertcat(w, x, y, z)
+
+def quat_normalize(q: ca.SX) -> ca.SX:
+    return q / (ca.sqrt(ca.dot(q, q)) + 1e-9)
+
+def orientation_error_from_quats(q_curr: ca.SX, q_ref: ca.SX) -> ca.SX:
     """
-    R_err = ca.mtimes([R_ref.T, R])
-    skew = 0.5 * (R_err - R_err.T)
-    return ca.vertcat(skew[2, 1], skew[0, 2], skew[1, 0])
+    基于四元数“减法”的姿态误差（左误差）：
+        q_err = conj(q_ref) ⊗ q_curr  对应 R_err = R_ref^T R
+        e = 2 * sign(q_err.w) * q_err.xyz  ∈ R^3
+    """
+    qc = quat_normalize(q_curr)
+    qr = quat_normalize(q_ref)
+    q_err = quat_mul(quat_conj(qr), qc)
+    s = ca.if_else(q_err[0] >= 0, 1.0, -1.0)
+    return 2.0 * s * ca.vertcat(q_err[1], q_err[2], q_err[3])
 
 
 def relaxed_log_barrier(h: ca.SX, mu: float, delta: float) -> ca.SX:
@@ -231,19 +244,17 @@ def relaxed_log_barrier(h: ca.SX, mu: float, delta: float) -> ca.SX:
 @dataclass
 class ReferenceTrajectory:
     """
-    从 npz 文件中加载预设的末端轨迹：
+    从 npz 文件中加载预设的末端轨迹（不使用欧拉角）：
       - t_grid: (N,)     时间戳
       - p_ref: (N,3)     末端位置（世界坐标）
-      - q_ref: (N,4)     末端姿态（四元数，假定仅绕 z 轴的 yaw）
+      - q_ref: (N,4)     末端姿态（单位四元数）
 
-    提供 sample(t_query) 接口，用于在任意时间 t 上插值得到 (p, q)。
-    对姿态，仅对 yaw 做线性插值，再构造四元数。
+    提供 sample(t_query)：位置线性插值，姿态用四元数 SLERP。
     """
 
     t_grid: np.ndarray
     p_ref: np.ndarray
     q_ref: np.ndarray
-    yaw_grid: np.ndarray
     period: float
 
     @classmethod
@@ -271,9 +282,6 @@ class ReferenceTrajectory:
         if t_grid.size < 2:
             raise ValueError("参考轨迹长度过短。")
 
-        # 仅支持绕 z 轴的 yaw，假定 q = [qw, 0, 0, qz]
-        yaw_grid = 2.0 * np.arctan2(q_ref[:, 3], q_ref[:, 0])
-
         dt = float(t_grid[1] - t_grid[0])
         period = float(dt * (t_grid.size - 1))
 
@@ -281,19 +289,16 @@ class ReferenceTrajectory:
             t_grid=t_grid,
             p_ref=p_ref,
             q_ref=q_ref,
-            yaw_grid=yaw_grid,
             period=period,
         )
 
     def sample(self, t_query: float) -> Tuple[np.ndarray, np.ndarray]:
         """
         在时间 t_query 上插值得到 (p, q)：
-          - 对位置做逐分量线性插值；
-          - 对 yaw 做线性插值，再构造 q = [cos(yaw/2), 0, 0, sin(yaw/2)]。
-        轨迹按 period 做周期延拓。
+          - 位置：逐分量线性插值
+          - 姿态：四元数 SLERP（避免欧拉角）
         """
         t0 = float(self.t_grid[0])
-        # 周期延拓
         t_mod = ((float(t_query) - t0) % self.period) + t0
 
         px = float(np.interp(t_mod, self.t_grid, self.p_ref[:, 0]))
@@ -301,10 +306,34 @@ class ReferenceTrajectory:
         pz = float(np.interp(t_mod, self.t_grid, self.p_ref[:, 2]))
         p = np.array([px, py, pz], dtype=float)
 
-        yaw = float(np.interp(t_mod, self.t_grid, self.yaw_grid))
-        qw = math.cos(yaw / 2.0)
-        qz = math.sin(yaw / 2.0)
-        q = np.array([qw, 0.0, 0.0, qz], dtype=float)
+        # slerp between neighboring keyframes
+        idx = int(np.searchsorted(self.t_grid, t_mod, side="right"))
+        i1 = min(max(idx, 1), self.t_grid.size - 1)
+        i0 = i1 - 1
+        t0_i = float(self.t_grid[i0])
+        t1_i = float(self.t_grid[i1])
+        alpha = 0.0 if t1_i == t0_i else (t_mod - t0_i) / (t1_i - t0_i)
+        q0 = self.q_ref[i0].astype(float)
+        q1 = self.q_ref[i1].astype(float)
+        dot = float(np.dot(q0, q1))
+        if dot < 0.0:
+            q1 = -q1
+            dot = -dot
+        dot = min(1.0, max(-1.0, dot))
+        if dot > 0.9995:
+            q = q0 + alpha * (q1 - q0)
+            q /= np.linalg.norm(q)
+        else:
+            theta_0 = math.acos(dot)
+            sin_0 = math.sin(theta_0)
+            s0 = math.sin((1.0 - alpha) * theta_0) / sin_0
+            s1 = math.sin(alpha * theta_0) / sin_0
+            q = s0 * q0 + s1 * q1
+        qn = np.linalg.norm(q)
+        if qn == 0.0:
+            q = q0
+            qn = np.linalg.norm(q)
+        q = q / qn
         return p, q
 
 
@@ -330,7 +359,9 @@ class MPCConfig:
     mu_barrier: float = 1e-2
     delta_barrier: float = 1e-3
 
-    # 关节和速度上下界（这里只对 φ_base + 6 个臂关节约束，x,y 不约束）
+    # 上下界：
+    #   - 关节位置：仅约束 6 个臂关节（不对 base 的 yaw 角做上下界）
+    #   - 速度：约束 φ̇_base + 6 个臂关节速度（x,y 不约束）
     q_min: float = -3.14
     q_max: float = 3.14
     dq_min: float = -1.0
@@ -355,6 +386,12 @@ class WholeBodyMPC:
         self.N = cfg.horizon_steps
 
         self._build_ocp()
+        # 存储上一次解用于 warm-start
+        self._X_guess: np.ndarray | None = None
+        self._U_guess: np.ndarray | None = None
+        # 存储上一次的对偶变量（拉格朗日乘子）
+        self._lam_g: np.ndarray | None = None
+        self._lam_x: np.ndarray | None = None
 
     def _build_ocp(self) -> None:
         N = self.N
@@ -387,12 +424,13 @@ class WholeBodyMPC:
         w_ori = self.cfg.w_ori
         R_u = self.cfg.R_u * ca.DM.eye(nu)
 
-        # 只对 φ_base + q1..q6 施加约束（共 7 个量），忽略 x,y
-        n_joints = 7
-        q_min_vec = self.cfg.q_min * ca.DM.ones(n_joints, 1)
-        q_max_vec = self.cfg.q_max * ca.DM.ones(n_joints, 1)
-        dq_min_vec = self.cfg.dq_min * ca.DM.ones(n_joints, 1)
-        dq_max_vec = self.cfg.dq_max * ca.DM.ones(n_joints, 1)
+        # 关节位置：仅 6 个臂关节；速度：φ̇_base + 6 个臂关节（共 7 个）
+        n_pos_joints = 6
+        n_vel_vars = 7
+        q_min_vec = self.cfg.q_min * ca.DM.ones(n_pos_joints, 1)
+        q_max_vec = self.cfg.q_max * ca.DM.ones(n_pos_joints, 1)
+        dq_min_vec = self.cfg.dq_min * ca.DM.ones(n_vel_vars, 1)
+        dq_max_vec = self.cfg.dq_max * ca.DM.ones(n_vel_vars, 1)
 
         # 初始条件
         opti.subject_to(X[:, 0] == x0_param)
@@ -413,7 +451,6 @@ class WholeBodyMPC:
             # 从参数矩阵中取出该阶段的参考 p_ref_k, q_ref_k
             p_ref_k = p_ref_param[:, k]
             q_ref_k = q_ref_param[:, k]
-            R_ref_k = quat_to_rot(q_ref_k)
 
             # 位置误差（单独增强 z 方向权重）
             pos_err = p_ee_k - p_ref_k
@@ -422,14 +459,16 @@ class WholeBodyMPC:
 
             pos_cost = w_pos_xy * ca.dot(pos_err_xy, pos_err_xy) + w_pos_z * pos_err_z * pos_err_z
 
-            # 姿态误差（SO(3)）
-            ori_err = orientation_error_from_rot_matrices(R_ee_k, R_ref_k)
+            # 姿态误差（四元数减法，左误差）
+            q_ee_k = rot_to_quat(R_ee_k)
+            ori_err = orientation_error_from_quats(q_ee_k, q_ref_k)
             ori_cost = w_ori * ca.dot(ori_err, ori_err)
 
             C_ee_k = pos_cost + ori_cost
 
-            # 关节 + base yaw 的索引：x[2] = φ_base, x[3:9] = q1..q6
-            q_joint = ca.vertcat(x_k[2], x_k[3:9])
+            # 关节索引：不对 base 的 yaw 角做上下界；只约束 6 个臂关节位置
+            q_joint = x_k[3:9]               # q1..q6
+            # 速度约束：包含 φ̇_base + 6 个臂关节速度
             dq_joint = ca.vertcat(u_k[2], u_k[3:9])
 
             # 关节位置/速度的硬约束（取代 barrier）:
@@ -450,6 +489,11 @@ class WholeBodyMPC:
             "ipopt.print_level": 0,
             "ipopt.max_iter": 80,
             "print_time": 0,
+            # 允许 warm-start
+            "ipopt.warm_start_init_point": "yes",
+            "ipopt.warm_start_bound_push": 1e-6,
+            "ipopt.warm_start_mult_bound_push": 1e-6,
+            "ipopt.mu_init": 1e-3,
         }
         opti.solver("ipopt", opts)
 
@@ -475,10 +519,57 @@ class WholeBodyMPC:
         self.opti.set_value(self.p_ref_param, p_ref_traj)
         self.opti.set_value(self.q_ref_param, q_ref_traj)
 
-        sol = self.opti.solve()
+        # 初值设置（warm start）
+        if self._X_guess is None or self._U_guess is None:
+            X_init = np.repeat(x0.reshape(-1, 1), self.N + 1, axis=1)
+            U_init = np.zeros((self.nu, self.N), dtype=float)
+        else:
+            X_prev = self._X_guess
+            U_prev = self._U_guess
+            if X_prev.shape[1] == self.N + 1 and U_prev.shape[1] == self.N:
+                X_init = np.hstack([X_prev[:, 1:], X_prev[:, [-1]]])
+                U_init = np.hstack([U_prev[:, 1:], U_prev[:, [-1]]])
+                X_init[:, 0] = x0
+            else:
+                X_init = np.repeat(x0.reshape(-1, 1), self.N + 1, axis=1)
+                U_init = np.zeros((self.nu, self.N), dtype=float)
+
+        self.opti.set_initial(self.X, X_init)
+        self.opti.set_initial(self.U, U_init)
+        # 复用对偶变量作为初值
+        if self._lam_g is not None:
+            try:
+                self.opti.set_initial(self.opti.lam_g, self._lam_g)
+            except Exception:
+                pass
+        if self._lam_x is not None:
+            try:
+                self.opti.set_initial(self.opti.lam_x, self._lam_x)
+            except Exception:
+                pass
+
+        try:
+            sol = self.opti.solve()
+        except Exception:
+            # 回退：清空对偶，重试
+            self._lam_g = None
+            self._lam_x = None
+            sol = self.opti.solve()
 
         X_star = np.array(sol.value(self.X))
         U_star = np.array(sol.value(self.U))
+        # 保存作为下一次初值
+        self._X_guess = X_star
+        self._U_guess = U_star
+        # 保存对偶变量
+        try:
+            lam_g_val = np.array(sol.value(self.opti.lam_g))
+            lam_x_val = np.array(sol.value(self.opti.lam_x))
+            self._lam_g = lam_g_val
+            self._lam_x = lam_x_val
+        except Exception:
+            self._lam_g = None
+            self._lam_x = None
         return X_star, U_star
 
 
@@ -644,7 +735,7 @@ def run_z1_whole_body_mpc_demo() -> None:
             # 用当前 x 更新 MuJoCo 姿态
             sim.reset_from_x(x, z_base=0.3)
 
-            # 可视化参考轨迹：在 user_scn 中画 EE 轨迹 (点+箭头)，基于预设轨迹
+            # 可视化参考轨迹：在 user_scn 中画 EE 轨迹 (点+箭头)
             user_scn = getattr(viewer, "user_scn", None)
             if user_scn is not None:
                 user_scn.ngeom = 0
@@ -658,6 +749,7 @@ def run_z1_whole_body_mpc_demo() -> None:
 
                 for idx_i in indices:
                     pos_world = ref_traj.p_ref[idx_i]
+                    q_world = ref_traj.q_ref[idx_i]
 
                     # 将 Pinocchio 世界坐标转换到 MuJoCo 世界坐标用于可视化
                     pos_vis = pos_world + ee_vis_offset
@@ -673,18 +765,15 @@ def run_z1_whole_body_mpc_demo() -> None:
                     )
                     geom_idx += 1
 
-                    # 表示 EE yaw 参考的箭头（黄色）：箭头方向沿 yaw 朝向（XY 平面）
-                    arrow_len = 0.12
-                    yaw_e = ref_traj.yaw_grid[idx_i]
-                    dir_xy = np.array(
-                        [math.cos(yaw_e), math.sin(yaw_e), 0.0], dtype=float
-                    )
+                    # 从四元数得到箭头：取局部 x 轴在世界坐标中的方向，投影到 XY 平面
+                    Rw = np.array(quat_to_rot(ca.DM(q_world)).full()).reshape(3, 3)
+                    dir3 = Rw @ np.array([1.0, 0.0, 0.0])
+                    dir_xy = np.array([dir3[0], dir3[1], 0.0])
                     norm_dir = np.linalg.norm(dir_xy)
                     if norm_dir < 1e-6:
                         dir_xy = np.array([1.0, 0.0, 0.0])
                         norm_dir = 1.0
-                    z_axis = dir_xy / norm_dir  # 作为局部 z 轴（箭头方向）
-                    # 构造一个正交基：先取全局 z，再叉积
+                    z_axis = dir_xy / norm_dir
                     up = np.array([0.0, 0.0, 1.0])
                     x_axis = np.cross(up, z_axis)
                     norm_x = np.linalg.norm(x_axis)
@@ -698,7 +787,7 @@ def run_z1_whole_body_mpc_demo() -> None:
                     mujoco.mjv_initGeom(
                         user_scn.geoms[geom_idx],
                         type=mujoco.mjtGeom.mjGEOM_ARROW,
-                        size=[0.005, 0.0075, arrow_len],
+                        size=[0.005, 0.0075, 0.12],
                         pos=pos_vis,
                         mat=R_vis.flatten(),
                         rgba=[1.0, 0.9, 0.1, 0.9],
