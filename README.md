@@ -1,4 +1,4 @@
-# Z1 Whole-body MPC Demo (`z1_whole_body_mpc_demo.py`)
+# Z1 Whole-body MPC Demo (`z1_demo.py`)
 
 本脚本在平面浮动基座 + 6 自由度机械臂模型上，演示一个基于速度层的 Whole-body MPC 控制器：
 
@@ -15,7 +15,7 @@
 
 在项目根目录下有：
 
-- `z1_whole_body_mpc_demo.py`：本 Demo 脚本
+- `z1_demo.py`：本 Demo 脚本（固定基 6 自由度，速度环 + 重力补偿）
 - `robot_description/z1.urdf`：Z1 机械臂 URDF（供 Pinocchio 使用）
 - `robot_description/z1_floating_base.xml`：带浮动基座的 MuJoCo 模型
 
@@ -23,7 +23,7 @@
 
 ```bash
 cd /path/to/drink_tea
-python z1_whole_body_mpc_demo.py
+python z1_demo.py
 ```
 
 ---
@@ -89,7 +89,7 @@ print("pinocchio.casadi OK:", cpin)
 PY
 ```
 
-若上述代码无异常输出，则说明 `pinocchio + casadi` 组合正确，`z1_whole_body_mpc_demo.py` 中的 FK/MPC 部分即可正常运行。
+若上述代码无异常输出，则说明 `pinocchio + casadi` 组合正确，`z1_demo.py` 中的 FK/MPC 部分即可正常运行。
 
 ---
 
@@ -130,7 +130,7 @@ pip install -e .
 
 ```bash
 cd /path/to/drink_tea
-python z1_whole_body_mpc_demo.py
+python z1_demo.py
 ```
 
 程序启动后会打开 MuJoCo Viewer，Z1 末端执行器沿随时间变化的椭圆轨迹运动，并在 `stdout` 中打印当前位置与参考位置之间的误差。

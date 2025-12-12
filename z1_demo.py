@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import time
+import os
 import numpy as np
 import casadi as ca
 import mujoco
 import mujoco.viewer
-
-import os, sys
-# Ensure repo root is on sys.path so `z1mpc` is importable when running this file directly
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 
 from z1mpc import RobotWrapper, MPCConfig, WholeBodyMPC, Z1MuJoCoSim, ReferenceTrajectory
 
@@ -21,8 +16,9 @@ def run() -> None:
     mpc = WholeBodyMPC(robot, cfg)
     sim = Z1MuJoCoSim()
 
-    # Load reference trajectory from repo root to avoid CWD issues
-    ref_npz_path = os.path.join(ROOT, "z1_mpc_reference_traj.npz")
+    # Load reference trajectory from repo root
+    root = os.path.abspath(os.path.dirname(__file__))
+    ref_npz_path = os.path.join(root, "z1_mpc_reference_traj.npz")
     ref_traj = ReferenceTrajectory.from_npz(ref_npz_path)
 
     # Initialize at model keyframe 'home' for consistent starting pose
@@ -43,15 +39,15 @@ def run() -> None:
     q_upper = np.asarray(robot.model.upperPositionLimit, dtype=float).reshape(-1)
 
     print("Starting Z1 MPC (6-DoF, fixed-base). Close viewer to stop.")
-    print(f"PARAMS: dt={cfg.dt}, N={cfg.horizon_steps}, w_pos_vec={getattr(cfg,'w_pos_vec', None)}, w_ori={cfg.w_ori}, kd={cfg.kd_arm}, R_u={cfg.R_u}")
+    print(
+        f"PARAMS: dt={cfg.dt}, N={cfg.horizon_steps}, w_pos_vec="
+        f"{getattr(cfg,'w_pos_vec', None)}, w_ori={cfg.w_ori}, kd={cfg.kd_arm}, R_u={cfg.R_u}"
+    )
 
     with mujoco.viewer.launch_passive(sim.model, sim.data) as viewer:
         t0 = time.time()
         last_mpc_time = -1e9
-        dt_sim = 0.02  # match legacy control update interval (solver cadence)
-        control_mode = os.environ.get("Z1_CONTROL_MODE", "torque").lower()  # torque | kinematic
-        if control_mode not in ("torque", "kinematic"):
-            control_mode = "torque"
+        dt_sim = 0.02  # control update cadence
         while viewer.is_running():
             t = time.time() - t0
 
@@ -71,30 +67,25 @@ def run() -> None:
 
                 X_star, U_star = mpc.solve(x, p_ref, q_ref)
                 u0 = U_star[:, 0]
-                # Legacy: clip joint velocities to dq_max=1.0
+                # Clip joint velocities
                 dq_max = 1.0
                 u0 = np.clip(u0, -dq_max, dq_max)
 
-                if control_mode == "torque":
-                    # Torque control with gravity compensation
-                    kd = cfg.kd_arm
-                    kd_vec = np.full(6, float(kd))
-                    g = robot.gravity(q_arm)
-                    tau_cmd = kd_vec * (u0 - v_arm) + g
-                    # Legacy clamp
-                    tau_limit = np.array([60.0, 60.0, 60.0, 60.0, 40.0, 40.0], dtype=float)
-                    tau_cmd = np.clip(tau_cmd, -tau_limit, tau_limit)
-                    sim.neutralize_actuators_to_q()
-                    sim.set_arm_torque(tau_cmd)
-                    # Integrate simulator to cover one control step
-                    mj_dt = float(sim.model.opt.timestep)
-                    # Legacy stepping covers cfg.dt per control update
-                    sub = max(1, int(round(cfg.dt / mj_dt)))
-                    sim.step_n(sub)
-                else:
-                    # Kinematic replay (closer to legacy observed behavior)
-                    q_des = q_arm + cfg.dt * u0
-                    sim.set_qpos(q_des)
+                # Torque control with gravity compensation
+                kd = cfg.kd_arm
+                kd_vec = np.full(6, float(kd))
+                g = robot.gravity(q_arm)
+                tau_cmd = kd_vec * (u0 - v_arm) + g
+                # Clamp torque per legacy behavior
+                tau_limit = np.array([60.0, 60.0, 60.0, 60.0, 40.0, 40.0], dtype=float)
+                tau_cmd = np.clip(tau_cmd, -tau_limit, tau_limit)
+                sim.neutralize_actuators_to_q()
+                sim.set_arm_torque(tau_cmd)
+
+                # Integrate simulator to cover one control step
+                mj_dt = float(sim.model.opt.timestep)
+                sub = max(1, int(round(cfg.dt / mj_dt)))
+                sim.step_n(sub)
                 last_mpc_time = t
 
                 # Debug EE error
@@ -113,9 +104,9 @@ def run() -> None:
                 p_now = np.array(p_now.full()).reshape(3)
                 draw_reference_and_current(viewer, user_scn, ref_traj.p_ref, ref_traj.q_ref, ee_vis_offset, p_now)
 
-            # Refresh viewer
             viewer.sync()
 
 
 if __name__ == "__main__":
     run()
+
