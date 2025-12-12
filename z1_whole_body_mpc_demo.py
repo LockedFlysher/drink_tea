@@ -106,43 +106,15 @@ class RobotWrapper:
         """Z1 机械臂关节自由度数（应为 6）"""
         return int(self.model.nq)
 
-    def fk_symbolic(self, x_full: ca.SX) -> Tuple[ca.SX, ca.SX]:
+    def fk_symbolic(self, q_arm: ca.SX) -> Tuple[ca.SX, ca.SX]:
         """
-        在 MPC 中的 FK：
-          输入  x = [x_base, y_base, φ_base, q1..q6]^T
-          输出  世界坐标下的末端位置/姿态 (p_ee, R_ee)
-
-        计算步骤：
-          1) 用 q_arm = x[3:9] 调用 Z1 的 FK，获得“臂基座”系下的 p_local, R_local
-          2) 平面 base 变换: T_base(x,y,φ) = Trans(x,y,0) · RotZ(φ)
-          3) 世界系下末端:
-                R = R_base * R_local
-                p = p_base + R_base * p_local
+        固定基：输入为 6 维关节向量 q_arm，返回世界坐标的末端位姿。
         """
-        # 拆分平面 base 与 arm 关节
-        x_base = x_full[0]
-        y_base = x_full[1]
-        phi_base = x_full[2]
-        q_arm = x_full[3 : 3 + self.model.nq]
-
-        # 机械臂 FK（在“臂基座”坐标系下）
+        if int(q_arm.shape[0]) != self.model.nq:
+            raise ValueError("fk_symbolic expects 6-dof arm q")
         p_local = self.fk_arm_pos(q_arm)
         R_local = self.fk_arm_rot(q_arm)
-
-        # 平面 base 变换
-        c = ca.cos(phi_base)
-        s = ca.sin(phi_base)
-        R_base = ca.vertcat(
-            ca.hcat([c, -s, 0]),
-            ca.hcat([s,  c, 0]),
-            ca.hcat([0,  0, 1]),
-        )
-        p_base = ca.vertcat(x_base, y_base, 0)
-
-        # 世界坐标下的末端位置和姿态
-        p_world = p_base + ca.mtimes(R_base, p_local)
-        R_world = ca.mtimes(R_base, R_local)
-        return p_world, R_world
+        return p_local, R_local
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +338,9 @@ class MPCConfig:
     q_max: float = 3.14
     dq_min: float = -1.0
     dq_max: float = 1.0
+    # 关节速度控制增益（用于 tau = kd*(v_des - v) + tau_g）
+    # 可用标量或 6 维向量；默认标量
+    kd_arm: float = 30.0
 
 #机械臂mpc
 class WholeBodyMPC:
@@ -380,9 +355,9 @@ class WholeBodyMPC:
     def __init__(self, robot: RobotWrapper, cfg: MPCConfig) -> None:
         self.robot = robot
         self.cfg = cfg
-        # 状态/控制维度固定为 9（[x,y,φ,q1..q6]）
-        self.nx = 9
-        self.nu = 9
+        # 固定基：只优化 6 个关节
+        self.nx = int(self.robot.nq_arm)  # 6
+        self.nu = self.nx                 # 6
         self.N = cfg.horizon_steps
 
         self._build_ocp()
@@ -424,9 +399,8 @@ class WholeBodyMPC:
         w_ori = self.cfg.w_ori
         R_u = self.cfg.R_u * ca.DM.eye(nu)
 
-        # 关节位置：仅 6 个臂关节；速度：φ̇_base + 6 个臂关节（共 7 个）
+        # 固定基：6 个臂关节的位置/速度上下界
         n_pos_joints = int(self.robot.nq_arm)
-        n_vel_vars = 7
         # 从 Pinocchio 读取 URDF 的位置上下界（单位：rad 或 m，随关节类型）
         q_lower_np = np.asarray(self.robot.model.lowerPositionLimit, dtype=float).reshape(-1)
         q_upper_np = np.asarray(self.robot.model.upperPositionLimit, dtype=float).reshape(-1)
@@ -444,10 +418,8 @@ class WholeBodyMPC:
             raise RuntimeError(
                 f"Pinocchio velocityLimit size mismatch: got {vel_lim_np.size}, expected {n_pos_joints}."
             )
-        dq_min_arr = np.concatenate(([self.cfg.dq_min], -vel_lim_np)).reshape((n_vel_vars, 1))
-        dq_max_arr = np.concatenate(([self.cfg.dq_max],  vel_lim_np)).reshape((n_vel_vars, 1))
-        dq_min_vec = ca.DM(dq_min_arr)
-        dq_max_vec = ca.DM(dq_max_arr)
+        dq_min_vec = ca.DM((-vel_lim_np).reshape((n_pos_joints, 1)))
+        dq_max_vec = ca.DM(( vel_lim_np).reshape((n_pos_joints, 1)))
 
         # 初始条件
         opti.subject_to(X[:, 0] == x0_param)
@@ -459,10 +431,10 @@ class WholeBodyMPC:
             u_k = U[:, k]
             x_next = X[:, k + 1]
 
-            # 离散动力学
+            # 离散动力学：q_{k+1} = q_k + dt * dq_k
             opti.subject_to(x_next == x_k + dt * u_k)
 
-            # 末端 FK
+            # 末端 FK（固定基，直接用 q_arm）
             p_ee_k, R_ee_k = self.robot.fk_symbolic(x_k)
 
             # 从参数矩阵中取出该阶段的参考 p_ref_k, q_ref_k
@@ -483,16 +455,17 @@ class WholeBodyMPC:
 
             C_ee_k = pos_cost + ori_cost
 
-            # 关节索引：不对 base 的 yaw 角做上下界；只约束 6 个臂关节位置
-            q_joint = x_k[3:9]               # q1..q6
-            # 速度约束：包含 φ̇_base + 6 个臂关节速度
-            dq_joint = ca.vertcat(u_k[2], u_k[3:9])
+            # 关节位置/速度约束（6 维）
+            q_joint = x_k
+            dq_joint = u_k
 
             # 关节位置/速度的硬约束（取代 barrier）:
             #   q_min <= q_joint <= q_max
             #   dq_min <= dq_joint <= dq_max
             opti.subject_to(opti.bounded(q_min_vec, q_joint, q_max_vec))
             opti.subject_to(opti.bounded(dq_min_vec, dq_joint, dq_max_vec))
+
+            # 固定基：无 base 变量，无需约束 base 速度
 
             # 控制能量
             effort_k = ca.mtimes([u_k.T, R_u, u_k])
@@ -604,19 +577,11 @@ class Z1MuJoCoSim:
       - 使用 mj_forward 更新画面
     """
 
-    def __init__(self, xml_path: str = "robot_description/z1_floating_base.xml") -> None:
+    def __init__(self, xml_path: str = "robot_description/z1.xml") -> None:
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
 
-        # 关闭重力，做纯 kinematic 回放
-        self.model.opt.gravity[:] = np.array([0.0, 0.0, 0.0])
-
-        # 获取 free joint 索引用于写 qpos/qvel
-        j_free = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_JOINT, "float_base_joint"
-        )
-        self.qpos_base = self.model.jnt_qposadr[j_free]
-        self.qvel_base = self.model.jnt_dofadr[j_free]
+        # 使用模型中配置的重力，由 MuJoCo 自己积分动力学（固定基模型，无 free joint）
 
         # 关节 joint1..joint6 的 qpos 起始索引
         self.joint_names = [f"joint{i+1}" for i in range(6)]
@@ -626,33 +591,51 @@ class Z1MuJoCoSim:
             ]
             for name in self.joint_names
         ]
+        self.joint_dof_indices = [
+            self.model.jnt_dofadr[
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            ]
+            for name in self.joint_names
+        ]
 
     def reset_from_x(self, x: np.ndarray, z_base: float = 0.3) -> None:
-        """
-        用控制层状态 x 重置 MuJoCo 中的 base + 臂姿态。
-        """
-        x = np.asarray(x).reshape(9)
-        x_base, y_base, phi_base = x[0], x[1], x[2]
-        q_arm = x[3:9]
-
-        # free joint: [x, y, z, qw, qx, qy, qz]
-        idx = self.qpos_base
-        self.data.qpos[idx + 0] = x_base
-        self.data.qpos[idx + 1] = y_base
-        self.data.qpos[idx + 2] = z_base
-
-        qw = math.cos(phi_base / 2.0)
-        qz = math.sin(phi_base / 2.0)
-        self.data.qpos[idx + 3] = qw
-        self.data.qpos[idx + 4] = 0.0
-        self.data.qpos[idx + 5] = 0.0
-        self.data.qpos[idx + 6] = qz
+        """固定基：仅设置 6 个关节位置。"""
+        q_arm = np.asarray(x, dtype=float).reshape(6)
 
         # arm joints
         for i, q_idx in enumerate(self.joint_qpos_indices):
             self.data.qpos[q_idx] = q_arm[i]
 
         mujoco.mj_forward(self.model, self.data)
+
+    def neutralize_actuators_to_q(self) -> None:
+        """将 actuator ctrl 设为当前关节角，使位置伺服误差为 0，避免抵消外加力矩。"""
+        # 假设模型中 actuator 名为 motor1..motor6
+        for i in range(6):
+            act_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"motor{i+1}")
+            if act_id >= 0:
+                q_idx = self.joint_qpos_indices[i]
+                self.data.ctrl[act_id] = float(self.data.qpos[q_idx])
+
+    def get_arm_state(self) -> tuple[np.ndarray, np.ndarray]:
+        """返回 (q_arm, v_arm) from MuJoCo。"""
+        q = np.array([self.data.qpos[idx] for idx in self.joint_qpos_indices], dtype=float)
+        v = np.array([self.data.qvel[idx] for idx in self.joint_dof_indices], dtype=float)
+        return q, v
+
+    def set_arm_torque(self, tau: np.ndarray) -> None:
+        """将 6 维关节力矩写入 qfrc_applied（覆盖/保持到下一次更新）。"""
+        tau = np.asarray(tau, dtype=float).reshape(6)
+        # 清零旧力
+        for dof_idx in self.joint_dof_indices:
+            self.data.qfrc_applied[dof_idx] = 0.0
+        # 写入新力矩
+        for i, dof_idx in enumerate(self.joint_dof_indices):
+            self.data.qfrc_applied[dof_idx] = float(tau[i])
+
+    def step_n(self, n: int = 1) -> None:
+        for _ in range(int(n)):
+            mujoco.mj_step(self.model, self.data)
 
 
 # --------------------------------------------------------------------------- #
@@ -676,12 +659,8 @@ def run_z1_whole_body_mpc_demo() -> None:
     # 预设的末端轨迹（位置 + yaw 姿态），从 NPZ 文件中加载
     ref_traj = ReferenceTrajectory.from_npz("z1_mpc_reference_traj.npz")
 
-    # 初始状态 x = [R_base, 0, 0, 0..0]（控制层坐标）
-    R_base = 0.0
-    x = np.zeros(9)
-    x[0] = R_base
-    x[1] = 0.0
-    x[2] = 0.0  # φ_base
+    # 初始状态（固定基）：x = q_arm ∈ R^6
+    x = np.zeros(6)
 
     # 用当前 x 初始化 MuJoCo 状态
     sim.reset_from_x(x, z_base=0.3)
@@ -697,6 +676,10 @@ def run_z1_whole_body_mpc_demo() -> None:
     horizon_T = cfg.horizon_steps * cfg.dt
 
     print("Starting Z1 whole-body MPC demo. Close viewer to stop.")
+
+    # 关节位置上下界（用于将 x0 裁剪回可行域，避免 IPOPT 因初值越界而 infeasible）
+    q_lower = np.asarray(robot.model.lowerPositionLimit, dtype=float).reshape(-1)
+    q_upper = np.asarray(robot.model.upperPositionLimit, dtype=float).reshape(-1)
 
     with mujoco.viewer.launch_passive(sim.model, sim.data) as viewer:
         t0 = time.time()
@@ -715,32 +698,61 @@ def run_z1_whole_body_mpc_demo() -> None:
                 p_ref_traj[:, k] = p_k
                 q_ref_traj[:, k] = q_k
 
-            # 每 dt_sim 调用一次 MPC
+            # 每 dt_sim 更新一次控制并用 MuJoCo step 积分
             if t - last_mpc_time >= dt_sim:
+                # 从 MuJoCo 读取当前臂状态
+                q_arm_mj, v_arm_mj = sim.get_arm_state()
+                # 将当前臂状态写回 x，并裁剪到 URDF 极限
+                x = np.minimum(np.maximum(q_arm_mj, q_lower), q_upper)
+
+                # 计算一次 MPC
                 X_star, U_star = mpc.solve(x, p_ref_traj, q_ref_traj)
                 u0 = U_star[:, 0]
 
                 # 为了数值稳定，在应用到系统前对速度做简单剪裁
-                v_xy_max = 0.3     # base 平移速度上限 [m/s]
-                v_phi_max = 1.0    # base yaw 角速度上限 [rad/s]
                 dq_max = 1.0       # 关节速度上限 [rad/s]
 
                 u0_clipped = u0.copy()
-                # base 线速度
-                u0_clipped[0] = float(np.clip(u0_clipped[0], -v_xy_max, v_xy_max))
-                u0_clipped[1] = float(np.clip(u0_clipped[1], -v_xy_max, v_xy_max))
-                # base yaw 角速度
-                u0_clipped[2] = float(np.clip(u0_clipped[2], -v_phi_max, v_phi_max))
                 # 6 个关节速度
-                u0_clipped[3:] = np.clip(u0_clipped[3:], -dq_max, dq_max)
+                u0_clipped = np.clip(u0_clipped, -dq_max, dq_max)
 
                 u0 = u0_clipped
-                # 更新内部状态 (Euler)
-                x = x + cfg.dt * u0
+
+                # --- 速度控制 + 重力补偿：tau = kd*(v_des - v_mj) + tau_g(pin) ---
+                v_des = u0.copy()
+                kd = cfg.kd_arm
+                if np.isscalar(kd):
+                    kd_vec = np.full(6, float(kd))
+                else:
+                    kd_arr = np.asarray(kd, dtype=float).reshape(-1)
+                    if kd_arr.size != 6:
+                        raise ValueError("cfg.kd_arm must be scalar or length-6 array")
+                    kd_vec = kd_arr
+
+                # Pinocchio 重力补偿（只计算 g，不计算 M/C）
+                pin.computeGeneralizedGravity(robot.model, robot.data, q_arm_mj)
+                g = robot.data.g.copy()
+
+                tau_cmd = kd_vec * (v_des - v_arm_mj) + g
+                # 简单的力矩限幅（必要时可调高/去掉）
+                tau_limit = np.array([60.0, 60.0, 60.0, 60.0, 40.0, 40.0], dtype=float)
+                tau_cmd = np.clip(tau_cmd, -tau_limit, tau_limit)
+                # 先使 actuator 位置伺服误差为 0，避免抵消外加力
+                sim.neutralize_actuators_to_q()
+                sim.set_arm_torque(tau_cmd)
+
+                # 固定基：不处理 base 位姿
+
+                # 用 MuJoCo 自身的动力学积分若干子步以覆盖一个控制周期
+                mj_dt = float(sim.model.opt.timestep)
+                substeps = max(1, int(round(cfg.dt / mj_dt)))
+                sim.step_n(substeps)
+
                 last_mpc_time = t
 
-                # 调试输出：末端执行器的当前位置与参考之间的误差
-                p_ee_mpc, _ = robot.fk_symbolic(ca.DM(x))
+                # 调试输出（基于最新状态）
+                q_arm_dbg, _ = sim.get_arm_state()
+                p_ee_mpc, _ = robot.fk_symbolic(ca.DM(q_arm_dbg))
                 p_ee_mpc = np.array(p_ee_mpc.full()).reshape(3)
                 p_ref_now = p_ref_traj[:, 0]
                 ee_err = p_ee_mpc - p_ref_now
@@ -748,9 +760,6 @@ def run_z1_whole_body_mpc_demo() -> None:
                     f"t={t:.2f}  EE pos={p_ee_mpc}  "
                     f"ref={p_ref_now}  err={ee_err}"
                 )
-
-            # 用当前 x 更新 MuJoCo 姿态
-            sim.reset_from_x(x, z_base=0.3)
 
             # 可视化参考轨迹：在 user_scn 中画 EE 轨迹 (点+箭头)
             user_scn = getattr(viewer, "user_scn", None)

@@ -2,6 +2,11 @@
   <compiler angle="radian" meshdir="assets"/>
 
   <option integrator="implicitfast"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="160" elevation="-20"/>
+  </visual>
 
   <default>
     <default class="z1">
@@ -17,6 +22,7 @@
   </default>
 
   <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
     <mesh file="z1_Link00.stl"/>
     <mesh file="z1_Link01.stl"/>
     <mesh file="z1_Link02.stl"/>
@@ -24,9 +30,16 @@
     <mesh file="z1_Link04.stl"/>
     <mesh file="z1_Link05.stl"/>
     <mesh file="z1_Link06.stl"/>
+    <!-- ground -->
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.8 0.2" rgb2="0.1 0.4 0.1"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
   </asset>
 
   <worldbody>
+    <light name="sun" pos="0 0 3" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8" ambient="0.2 0.2 0.2" specular="0.1 0.1 0.1"/>
+    <light name="fill" pos="2 2 1" diffuse="0.3 0.3 0.35" specular="0.05 0.05 0.05"/>
+    <geom name="floor" type="plane" pos="0 0 0" size="0 0 0.05" material="groundplane" contype="1" conaffinity="1"/>
     <body name="link00" childclass="z1">
       <inertial pos="-0.00334984 -0.00013615 0.0249584" quat="-0.00692194 0.682592 0.00133293 0.730766" mass="0.472475"
         diaginertia="0.000531375 0.000415207 0.000378658"/>
