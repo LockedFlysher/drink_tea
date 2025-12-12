@@ -13,7 +13,8 @@
       <joint damping="1" frictionloss="1"/>
       <general biastype="affine" gainprm="1000" biasprm="0 -1000 -100" forcerange="-30 30"/>
       <default class="visual">
-        <geom type="mesh" group="2" contype="0" conaffinity="0"/>
+        <!-- 半透明视觉几何（不参与碰撞） -->
+        <geom type="mesh" group="2" contype="0" conaffinity="0" rgba="1 1 1 0.35"/>
       </default>
       <default class="collision">
         <geom type="cylinder" group="3" mass="0" density="0"/>

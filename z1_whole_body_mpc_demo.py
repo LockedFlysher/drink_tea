@@ -318,10 +318,9 @@ class ReferenceTrajectory:
 class MPCConfig:
     horizon_steps: int = 20
     dt: float = 0.1
-    # EE 跟踪权重（位置 / 姿态），适当加大以优先保证末端轨迹
-    # 位置部分对 x/y 和 z 分别加权，方便强调高度方向
-    w_pos_xy: float = 50.0    # EE 在 x/y 方向的位置权重
-    w_pos_z:  float = 200.0   # EE 在 z 方向的位置权重（提高高度跟踪优先级）
+    # EE 跟踪权重（位置 / 姿态）
+    # 位置：x/y/z 一致的权重
+    w_pos: float = 600.0      # EE 位置统一权重（xyz 一致）
     w_ori:    float = 50.0    # 末端姿态（yaw 等）跟踪权重，提高 yaw 跟踪优先级
     # base (x,y) 位置跟踪权重（目前不加入代价，只保留字段备用）
     w_base: float = 0.0
@@ -340,7 +339,7 @@ class MPCConfig:
     dq_max: float = 1.0
     # 关节速度控制增益（用于 tau = kd*(v_des - v) + tau_g）
     # 可用标量或 6 维向量；默认标量
-    kd_arm: float = 30.0
+    kd_arm: float = 20.0
 
 #机械臂mpc
 class WholeBodyMPC:
@@ -394,8 +393,7 @@ class WholeBodyMPC:
         self.p_ref_param = p_ref_param
         self.q_ref_param = q_ref_param
 
-        w_pos_xy = self.cfg.w_pos_xy
-        w_pos_z = self.cfg.w_pos_z
+        w_pos = self.cfg.w_pos
         w_ori = self.cfg.w_ori
         R_u = self.cfg.R_u * ca.DM.eye(nu)
 
@@ -441,12 +439,9 @@ class WholeBodyMPC:
             p_ref_k = p_ref_param[:, k]
             q_ref_k = q_ref_param[:, k]
 
-            # 位置误差（单独增强 z 方向权重）
+            # 位置误差（xyz 等权）
             pos_err = p_ee_k - p_ref_k
-            pos_err_xy = pos_err[0:2]
-            pos_err_z = pos_err[2]
-
-            pos_cost = w_pos_xy * ca.dot(pos_err_xy, pos_err_xy) + w_pos_z * pos_err_z * pos_err_z
+            pos_cost = w_pos * ca.dot(pos_err, pos_err)
 
             # 姿态误差（四元数减法，左误差）
             q_ee_k = rot_to_quat(R_ee_k)
@@ -819,6 +814,22 @@ def run_z1_whole_body_mpc_demo() -> None:
                         rgba=[1.0, 0.9, 0.1, 0.9],
                     )
                     geom_idx += 1
+
+                # 当前（用于优化的）末端位置：用当前 MuJoCo 关节 + Pinocchio FK
+                q_arm_now, _ = sim.get_arm_state()
+                p_ee_now, _ = robot.fk_symbolic(ca.DM(q_arm_now))
+                p_ee_now = np.array(p_ee_now.full()).reshape(3)
+                pos_vis_now = p_ee_now + ee_vis_offset
+
+                mujoco.mjv_initGeom(
+                    user_scn.geoms[geom_idx],
+                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                    size=[0.01, 0.0, 0.0],
+                    pos=pos_vis_now,
+                    mat=np.eye(3).flatten(),
+                    rgba=[1.0, 0.0, 0.0, 1.0],  # 红点，表示“参与优化的 EE 位置”
+                )
+                geom_idx += 1
 
                 user_scn.ngeom = geom_idx
 

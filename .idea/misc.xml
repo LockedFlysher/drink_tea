@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="drink_tea" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="drink_tea" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="pynebula" project-jdk-type="Python SDK" />
 </project>
