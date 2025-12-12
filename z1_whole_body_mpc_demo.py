@@ -425,12 +425,29 @@ class WholeBodyMPC:
         R_u = self.cfg.R_u * ca.DM.eye(nu)
 
         # 关节位置：仅 6 个臂关节；速度：φ̇_base + 6 个臂关节（共 7 个）
-        n_pos_joints = 6
+        n_pos_joints = int(self.robot.nq_arm)
         n_vel_vars = 7
-        q_min_vec = self.cfg.q_min * ca.DM.ones(n_pos_joints, 1)
-        q_max_vec = self.cfg.q_max * ca.DM.ones(n_pos_joints, 1)
-        dq_min_vec = self.cfg.dq_min * ca.DM.ones(n_vel_vars, 1)
-        dq_max_vec = self.cfg.dq_max * ca.DM.ones(n_vel_vars, 1)
+        # 从 Pinocchio 读取 URDF 的位置上下界（单位：rad 或 m，随关节类型）
+        q_lower_np = np.asarray(self.robot.model.lowerPositionLimit, dtype=float).reshape(-1)
+        q_upper_np = np.asarray(self.robot.model.upperPositionLimit, dtype=float).reshape(-1)
+        if q_lower_np.size != n_pos_joints or q_upper_np.size != n_pos_joints:
+            raise RuntimeError(
+                f"Pinocchio limits size mismatch: got {q_lower_np.size}/{q_upper_np.size}, expected {n_pos_joints}."
+            )
+        q_min_vec = ca.DM(q_lower_np).reshape((n_pos_joints, 1))
+        q_max_vec = ca.DM(q_upper_np).reshape((n_pos_joints, 1))
+        # 速度上下界：
+        #   - base φ̇ 使用配置（仍保留速度限制）
+        #   - 6 个臂关节使用 Pinocchio 的 velocityLimit
+        vel_lim_np = np.asarray(self.robot.model.velocityLimit, dtype=float).reshape(-1)
+        if vel_lim_np.size != n_pos_joints:
+            raise RuntimeError(
+                f"Pinocchio velocityLimit size mismatch: got {vel_lim_np.size}, expected {n_pos_joints}."
+            )
+        dq_min_arr = np.concatenate(([self.cfg.dq_min], -vel_lim_np)).reshape((n_vel_vars, 1))
+        dq_max_arr = np.concatenate(([self.cfg.dq_max],  vel_lim_np)).reshape((n_vel_vars, 1))
+        dq_min_vec = ca.DM(dq_min_arr)
+        dq_max_vec = ca.DM(dq_max_arr)
 
         # 初始条件
         opti.subject_to(X[:, 0] == x0_param)
