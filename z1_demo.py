@@ -22,7 +22,7 @@ def run() -> None:
     ref_traj = ReferenceTrajectory.from_npz(ref_npz_path)
 
     # Initialize at model keyframe 'home' for consistent starting pose
-    sim.reset_keyframe("home")
+    sim.reset_keyframe("pos1")
     x, _ = sim.get_arm_state()
 
     # EE visualization offset between Pinocchio and MuJoCo (fallback to zero)

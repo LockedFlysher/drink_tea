@@ -18,10 +18,10 @@ class Z1ReferenceTrajectoryConfig:
     """
     dt_ref: float = 0.02
     period: float = 10.0
-    ellipse_center: np.ndarray = field(default_factory=lambda: np.array([0.3, 0.0, 0.3]))
-    a: float = 0.1  # x 方向半径
-    b: float = 0.1  # y 方向半径
-    z_amp: float = 0.1
+    ellipse_center: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.4, 0.4]))
+    a: float = 0.00001  # x 方向半径
+    b: float = 0.00001  # y 方向半径
+    z_amp: float = 0.00001
 
 
 def generate_reference_trajectory(cfg: Z1ReferenceTrajectoryConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
