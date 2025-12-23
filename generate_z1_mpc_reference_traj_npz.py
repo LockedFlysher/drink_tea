@@ -18,7 +18,7 @@ class Z1ReferenceTrajectoryConfig:
     """
     dt_ref: float = 0.02
     period: float = 10.0
-    ellipse_center: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.4, 0.4]))
+    ellipse_center: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2, 0.4]))
     a: float = 0.00001  # x 方向半径
     b: float = 0.00001  # y 方向半径
     z_amp: float = 0.00001
@@ -43,7 +43,7 @@ def generate_reference_trajectory(cfg: Z1ReferenceTrajectoryConfig) -> tuple[np.
     cx, cy, cz = cfg.ellipse_center
 
     # 固定初始姿态（yaw=0 -> 身体 x 轴朝世界 x 轴）
-    qw0, qx0, qy0, qz0 = 1.0, 0.0, 0.0, 0.0
+    qw0, qx0, qy0, qz0 = 1, 0, 0, 0
 
     for i, ti in enumerate(t):
         theta_e = 2.0 * math.pi * ti / period

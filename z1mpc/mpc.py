@@ -22,15 +22,16 @@ class MPCConfig:
     horizon_steps: int = 20
     dt: float = 0.1
     # Position/orientation tracking weights (legacy-style, separate z weight)
-    w_pos_vec: tuple[float, float, float] = (50.0, 50.0, 200.0)
-    w_ori: float = 50.0
+    w_pos_vec: tuple[float, float, float] = (50.0, 50.0, 50.0)
+    w_ori: float = 1.0
     # Control weight (L2)
-    R_u: float = 1.0
+    R_u: float = 0.1
     # Velocity limits fallback (will use URDF limits if available)
     dq_min: float = -1.0
     dq_max: float = 1.0
     # Velocity control gain for torque-level tracking (used outside MPC)
     kd_arm: float = 30.0
+    terminal_cost : float = 10.0
 
 
 class WholeBodyMPC:
@@ -120,6 +121,9 @@ class WholeBodyMPC:
 
             effort_k = ca.mtimes([u_k.T, R_u, u_k])
             total_cost += pos_cost + ori_cost + effort_k
+
+            # if k == self.N - 1:
+            #     total_cost += (pos_cost + ori_cost + effort_k)*self.cfg.terminal_cost
 
         opti.minimize(total_cost)
 
